@@ -4,14 +4,14 @@ version = "0.5.3"
 edition = "2024"
 description = "An infinite whiteboard canvas for GPUI: shapes, arrows, freehand drawing, text, images, and templates, with a built-in toolbar."
 license = "MIT"
-repository = "https://github.com/packetThrower/zorite"
+repository = "https://github.com/packetThrower/gpui-whiteboard"
 homepage = "https://packetthrower.github.io/zorite/reference/crates/gpui-whiteboard/"
 keywords = ["gpui", "whiteboard", "canvas", "drawing", "infinite-canvas"]
 categories = ["gui", "graphics"]
 
 [dependencies]
-# Shared workspace spec (the root pins the rev) so Cargo unifies to one gpui.
-gpui = { workspace = true }
+# gpui ships on crates.io as the `gpui-pre` family; a caret spec so users aren't pinned to one snapshot.
+gpui = { package = "gpui-pre", version = "0.3" }
 
 # The board model (`Scene` + camera, and elements once drawing lands) is owned
 # and (de)serialized by this crate, so the host can persist it as an opaque
@@ -29,4 +29,4 @@ log = "0.4"
 ttf-parser = "0.25"
 
 [dev-dependencies]
-gpui = { workspace = true, features = ["test-support"] }
+gpui = { package = "gpui-pre", version = "0.3", features = ["test-support"] }
