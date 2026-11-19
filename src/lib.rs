@@ -48,7 +48,7 @@ use gpui::{
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, GlobalElementId, Hsla,
     InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, PathBuilder,
-    PinchEvent, Pixels, Point, Render, Rgba, ScrollDelta, ScrollWheelEvent, SharedString,
+    PinchEvent, Pixels, Point, Render, Rgba, ScrollDelta, ScrollEvent, SharedString,
     StatefulInteractiveElement, Style, Styled, StyledImage, TransformationMatrix, UTF16Selection,
     Window, canvas, div, fill, hsla, linear_color_stop, linear_gradient, point, px, relative, rgba,
     size,
@@ -4518,7 +4518,7 @@ impl WhiteboardView {
         }
     }
 
-    fn on_scroll(&mut self, ev: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_scroll(&mut self, ev: &ScrollEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let (dx, dy) = match ev.delta {
             ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y)),
             ScrollDelta::Lines(p) => {
@@ -7437,7 +7437,7 @@ impl Render for WhiteboardView {
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_middle_up))
             .on_mouse_move(cx.listener(Self::on_move));
         let root = if accepts_wheel_input(self.read_only) {
-            root.on_scroll_wheel(cx.listener(Self::on_scroll))
+            root.on_scroll(cx.listener(Self::on_scroll))
         } else {
             root
         };
