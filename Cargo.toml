@@ -1,6 +1,6 @@
 [package]
 name = "gpui-whiteboard"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 description = "An infinite whiteboard canvas for GPUI: shapes, arrows, freehand drawing, text, images, and templates, with a built-in toolbar."
 license = "MIT"
@@ -11,7 +11,7 @@ categories = ["gui", "graphics"]
 
 [dependencies]
 # gpui ships on crates.io as the `gpui-pre` family; a caret spec so users aren't pinned to one snapshot.
-gpui = { package = "gpui-pre", version = "0.3" }
+gpui = { package = "gpui-pre", version = "0.3.12" }
 
 # The board model (`Scene` + camera, and elements once drawing lands) is owned
 # and (de)serialized by this crate, so the host can persist it as an opaque
@@ -29,4 +29,4 @@ log = "0.4"
 ttf-parser = "0.25"
 
 [dev-dependencies]
-gpui = { package = "gpui-pre", version = "0.3", features = ["test-support"] }
+gpui = { package = "gpui-pre", version = "0.3.12", features = ["test-support"] }
