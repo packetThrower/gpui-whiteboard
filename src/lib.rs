@@ -4887,7 +4887,14 @@ impl WhiteboardView {
         self.caret = floor_boundary(&content, self.caret);
         self.sel_anchor = floor_boundary(&content, self.sel_anchor);
         let ks = &ev.keystroke;
-        if ks.is_ime_in_progress() {
+        // gpui calls any keydown without a key_char "IME in progress", but on
+        // Windows Enter and Tab never carry one (control characters are
+        // dropped), so for them only live marked text means a composition.
+        let composing = match ks.key.as_str() {
+            "enter" | "tab" => self.marked_range.is_some(),
+            _ => ks.is_ime_in_progress(),
+        };
+        if composing {
             return;
         }
         // Keys handled here (Enter, navigation, clipboard) must not also reach
@@ -8447,6 +8454,21 @@ mod input_tests {
                 _ => None,
             });
             assert_eq!(content.as_deref(), Some("ab\ncd"));
+        });
+        // Windows: Enter arrives with no key_char, which gpui reads as an IME
+        // composition; it must still break the line.
+        cx.simulate_event(KeyDownEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_input("e");
+        board.read_with(&cx, |b, _| {
+            let content = b.scene.elements.iter().find_map(|e| match &e.kind {
+                ElementKind::Text(t) => Some(t.content.clone()),
+                _ => None,
+            });
+            assert_eq!(content.as_deref(), Some("ab\ncd\ne"));
         });
     }
 }
