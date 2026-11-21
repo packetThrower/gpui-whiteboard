@@ -5572,6 +5572,14 @@ impl WhiteboardView {
     }
 }
 
+/// The board's own focus: focus it (e.g. on opening a board) so tool keys
+/// and shortcuts reach the board without a click first.
+impl gpui::Focusable for WhiteboardView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
 impl Render for WhiteboardView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.read_only {
