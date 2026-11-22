@@ -481,8 +481,9 @@ pub struct SegGeom {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub bend: f32,
     /// Where along the line the curve peaks, as a fraction of the way from
-    /// (x1, y1) to (x2, y2): 0.5 (the default) is symmetric. Kept within
-    /// 0.1–0.9. Absent in older boards.
+    /// (x1, y1) to (x2, y2): 0.5 (the default) is symmetric; off-center skews
+    /// the curve toward that end. Kept within 0.05–0.95. Absent in older
+    /// boards.
     #[serde(default = "half", skip_serializing_if = "is_half")]
     pub bend_at: f32,
 }
@@ -500,27 +501,27 @@ fn is_half(v: &f32) -> bool {
 }
 
 impl SegGeom {
-    /// The quadratic Bézier control point of a bent segment, chosen so the
-    /// curve passes through [`bend_point`](Self::bend_point) at `t = bend_at`;
+    /// The quadratic Bézier control point of a bent segment, chosen so
+    /// [`bend_point`](Self::bend_point) is the curve's apex — its farthest
+    /// point from the straight line (a quadratic's apex is always its `t =
+    /// 0.5` point, so the control point is `2 × apex − chord middle`).
     /// `None` when straight.
     pub fn control(&self) -> Option<[f32; 2]> {
         (self.bend != 0.0).then(|| {
             let [px, py] = self.bend_point();
-            let a = self.bend_at();
-            let (u, k) = ((1.0 - a) * (1.0 - a), 2.0 * a * (1.0 - a));
             [
-                (px - u * self.x1 - a * a * self.x2) / k,
-                (py - u * self.y1 - a * a * self.y2) / k,
+                2.0 * px - (self.x1 + self.x2) / 2.0,
+                2.0 * py - (self.y1 + self.y2) / 2.0,
             ]
         })
     }
 
-    /// `bend_at`, kept clear of the ends (where the curve would blow up).
+    /// `bend_at`, kept off the very ends.
     fn bend_at(&self) -> f32 {
-        self.bend_at.clamp(0.1, 0.9)
+        self.bend_at.clamp(0.05, 0.95)
     }
 
-    /// The curve's peak — `bend_at` of the way along the line, `bend × length`
+    /// The curve's apex — `bend_at` of the way along the line, `bend × length`
     /// off it — where the bend handle sits (on the line when straight).
     pub fn bend_point(&self) -> [f32; 2] {
         let (dx, dy) = (self.x2 - self.x1, self.y2 - self.y1);
@@ -545,14 +546,14 @@ impl SegGeom {
     }
 
     /// The `bend_at` that slides the curve's peak along the line toward world
-    /// point `p` (clamped to 0.1–0.9).
+    /// point `p` (clamped to 0.05–0.95).
     pub fn bend_at_toward(&self, p: [f32; 2]) -> f32 {
         let (dx, dy) = (self.x2 - self.x1, self.y2 - self.y1);
         let len2 = dx * dx + dy * dy;
         if len2 < 1e-6 {
             return 0.5;
         }
-        (((p[0] - self.x1) * dx + (p[1] - self.y1) * dy) / len2).clamp(0.1, 0.9)
+        (((p[0] - self.x1) * dx + (p[1] - self.y1) * dy) / len2).clamp(0.05, 0.95)
     }
 
     /// `n + 1` points along the line, ends included.

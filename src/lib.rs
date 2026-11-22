@@ -9997,8 +9997,8 @@ mod board_tests {
         );
         let mid = s.bend_point();
         assert!((mid[1] - 150.0).abs() < 2.0, "the curve passes the pointer");
-        // With Shift the peak also slides along the line, and the curve
-        // still passes under the pointer.
+        // With Shift the peak also slides along the line; the handle stays
+        // the curve's apex (its farthest point from the line).
         let shift = Modifiers::shift();
         cx.simulate_mouse_down(at(mid[0], mid[1]), MouseButton::Left, shift);
         cx.simulate_mouse_move(at(150.0, 160.0), MouseButton::Left, shift);
@@ -10010,10 +10010,15 @@ mod board_tests {
             "peak a quarter along: {}",
             s.bend_at
         );
-        let peak = s.points(24)[6]; // t = 0.25
+        let pts = s.points(24);
+        let apex = pts
+            .iter()
+            .copied()
+            .max_by(|a, b| (200.0 - a[1]).total_cmp(&(200.0 - b[1])))
+            .unwrap();
         assert!(
-            (peak[0] - 150.0).abs() < 2.0 && (peak[1] - 150.0).abs() < 2.0,
-            "the curve passes the pointer: {peak:?}"
+            (apex[0] - 150.0).abs() < 4.0 && (apex[1] - 150.0).abs() < 1.0,
+            "the apex is under the pointer: {apex:?}"
         );
         // …and snaps back straight near the line.
         let mid = s.bend_point();
