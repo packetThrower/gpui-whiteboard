@@ -474,6 +474,67 @@ pub struct SegGeom {
     /// Attachment for the second endpoint. Absent in older boards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_anchor: Option<SegmentAnchor>,
+    /// How far the line bows: its middle sits `bend × length` off the
+    /// straight line's middle, to one side (the sign picks which). Relative to
+    /// the length, so a curve keeps its shape as its ends move. 0 = straight.
+    /// Absent in older boards.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bend: f32,
+}
+
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
+}
+
+impl SegGeom {
+    /// The quadratic Bézier control point of a bent segment; `None` when
+    /// straight.
+    pub fn control(&self) -> Option<[f32; 2]> {
+        (self.bend != 0.0).then(|| {
+            let [x, y] = self.bend_point();
+            let (mx, my) = ((self.x1 + self.x2) / 2.0, (self.y1 + self.y2) / 2.0);
+            [2.0 * x - mx, 2.0 * y - my]
+        })
+    }
+
+    /// The middle of the curve (the chord's middle when straight) — where the
+    /// bend handle sits.
+    pub fn bend_point(&self) -> [f32; 2] {
+        let (dx, dy) = (self.x2 - self.x1, self.y2 - self.y1);
+        [
+            (self.x1 + self.x2) / 2.0 - dy * self.bend,
+            (self.y1 + self.y2) / 2.0 + dx * self.bend,
+        ]
+    }
+
+    /// The `bend` that puts the curve's middle nearest world point `p`.
+    pub fn bend_toward(&self, p: [f32; 2]) -> f32 {
+        let (dx, dy) = (self.x2 - self.x1, self.y2 - self.y1);
+        let len2 = dx * dx + dy * dy;
+        if len2 < 1e-6 {
+            return 0.0;
+        }
+        let (mx, my) = ((self.x1 + self.x2) / 2.0, (self.y1 + self.y2) / 2.0);
+        ((p[0] - mx) * -dy + (p[1] - my) * dx) / len2
+    }
+
+    /// `n + 1` points along the line, ends included.
+    pub fn points(&self, n: usize) -> Vec<[f32; 2]> {
+        let (p1, p2) = ([self.x1, self.y1], [self.x2, self.y2]);
+        let Some(c) = self.control() else {
+            return vec![p1, p2];
+        };
+        (0..=n)
+            .map(|i| {
+                let t = i as f32 / n as f32;
+                let u = 1.0 - t;
+                [
+                    u * u * p1[0] + 2.0 * u * t * c[0] + t * t * p2[0],
+                    u * u * p1[1] + 2.0 * u * t * c[1] + t * t * p2[1],
+                ]
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -1216,10 +1216,21 @@ pub(crate) fn paint_segment(
     let mut points = vec![p1f];
     let (dxw, _dyw) = (seg.x2 - seg.x1, seg.y2 - seg.y1);
     let (end_dx, end_dy) = match style {
-        MindMapConnectorStyle::Straight => {
-            points.push(p2f);
-            (p2f[0] - p1f[0], p2f[1] - p1f[1])
-        }
+        MindMapConnectorStyle::Straight => match seg.control() {
+            // A bent line: sample the curve; the head follows its end tangent.
+            Some(c) => {
+                for p in &seg.points(24)[1..] {
+                    let s = to_screen(p[0], p[1], cam, origin);
+                    points.push([f32::from(s.x), f32::from(s.y)]);
+                }
+                let c = to_screen(c[0], c[1], cam, origin);
+                (p2f[0] - f32::from(c.x), p2f[1] - f32::from(c.y))
+            }
+            None => {
+                points.push(p2f);
+                (p2f[0] - p1f[0], p2f[1] - p1f[1])
+            }
+        },
         MindMapConnectorStyle::Bezier => {
             let cx1 = seg.x1 + dxw * 0.35;
             let cy1 = seg.y1;
@@ -1459,10 +1470,12 @@ pub(crate) fn paint_selection(
     color: Hsla,
     window: &mut Window,
 ) {
-    // Lines/arrows: a handle at each endpoint (no box — its bbox is degenerate)
+    // Lines/arrows: a handle at each endpoint and one mid-curve to bend it (no
+    // box — its bbox can be degenerate)
     // plus a rotate grip above.
     if let ElementKind::Line(s) | ElementKind::Arrow(s) = kind {
-        for (wx, wy) in [(s.x1, s.y1), (s.x2, s.y2)] {
+        let [bx, by] = s.bend_point();
+        for (wx, wy) in [(s.x1, s.y1), (s.x2, s.y2), (bx, by)] {
             let p = to_screen(wx, wy, cam, origin);
             draw_handle(f32::from(p.x), f32::from(p.y), color, window);
         }

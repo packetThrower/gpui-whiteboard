@@ -278,12 +278,7 @@ pub(crate) fn bbox(kind: &ElementKind) -> (f32, f32, f32, f32) {
     }
     match kind {
         ElementKind::Draw(s) => aabb(&s.points),
-        ElementKind::Line(s) | ElementKind::Arrow(s) => (
-            s.x1.min(s.x2),
-            s.y1.min(s.y2),
-            s.x1.max(s.x2),
-            s.y1.max(s.y2),
-        ),
+        ElementKind::Line(s) | ElementKind::Arrow(s) => aabb(&s.points(16)),
         ElementKind::Embed(em) => (em.x, em.y, em.x + em.w, em.y + em.h),
         // Handled above (all box-like kinds go through `box_like`).
         ElementKind::Rect(_)

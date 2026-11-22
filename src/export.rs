@@ -126,10 +126,16 @@ fn segment(s: &SegGeom, arrow: bool, style: MindMapConnectorStyle, ink: u32) -> 
     let (p1, p2) = ([s.x1, s.y1], [s.x2, s.y2]);
     let dx = s.x2 - s.x1;
     let (path, end_dir) = match style {
-        MindMapConnectorStyle::Straight => (
-            vec![Seg::Move(p1), Seg::Line(p2)],
-            [s.x2 - s.x1, s.y2 - s.y1],
-        ),
+        MindMapConnectorStyle::Straight => match s.control() {
+            Some(c) => (
+                vec![Seg::Move(p1), Seg::Quad(c, p2)],
+                [p2[0] - c[0], p2[1] - c[1]],
+            ),
+            None => (
+                vec![Seg::Move(p1), Seg::Line(p2)],
+                [s.x2 - s.x1, s.y2 - s.y1],
+            ),
+        },
         MindMapConnectorStyle::Bezier => {
             let (c1, c2) = ([s.x1 + dx * 0.35, s.y1], [s.x2 - dx * 0.35, s.y2]);
             (

@@ -25,7 +25,7 @@ world-space `f32` (see [`Camera`](#camera)).
 | [`ElementKind`](#elementkind) | enum | 14 variants | What an element is (pen stroke, shape, text, …) |
 | [`Stroke`](#stroke) | struct | `{ points, width }` | Freehand pen geometry |
 | [`BoxGeom`](#boxgeom) | struct | `{ x, y, w, h, width, rotation }` | Box-shape geometry (rect/ellipse/…) |
-| [`SegGeom`](#seggeom) | struct | `{ x1, y1, x2, y2, width, style, start_anchor, end_anchor }` | Line / arrow geometry |
+| [`SegGeom`](#seggeom) | struct | `{ x1, y1, x2, y2, width, style, start_anchor, end_anchor, bend }` | Line / arrow geometry, straight or curved |
 | [`SegmentStyle`](#segmentstyle) | enum | `Solid \| Dashed` | A line/arrow's stroke style |
 | [`SegmentAnchor`](#segmentanchor) | struct | `{ element_id, connector }` | A segment endpoint bound to a shape |
 | [`MindMapNodeMeta`](#mindmapnodemeta) | struct | `{ parent, side, order, root_direction, connector_style }` | Mind-map metadata on an element |
@@ -45,7 +45,7 @@ world-space `f32` (see [`Camera`](#camera)).
 | [`StyleSpan`](#stylespan) | struct | `{ start, end, style }` | A formatting run over a byte range |
 | [`RunStyle`](#runstyle) | struct | `{ bold, italic, underline, strike, highlight }` | The formatting of a run of characters |
 | [`Format`](#format) | enum | `Bold \| Italic \| Underline \| Strike` | A toggleable boolean format |
-| [`Tool`](#tool) | enum | 19 variants | The active tool (UI state, not persisted) |
+| [`Tool`](#tool) | enum | 22 variants | The active tool (UI state, not persisted) |
 | [`WhiteboardStyle`](#whiteboardstyle) | struct | 9 fields | Theme colors, read at paint time |
 | [`WhiteboardStyleFn`](#whiteboardstylefn) | type alias | `Rc<dyn Fn() -> WhiteboardStyle>` | The host's theme closure |
 | [`ChangeFn`](#changefn) | type alias | `Rc<dyn Fn(String, &mut Window, &mut App)>` | Persist-on-change hook |
@@ -330,11 +330,19 @@ pub struct SegGeom {
     pub style: SegmentStyle,               // serde default: Solid
     pub start_anchor: Option<SegmentAnchor>, // serde default: None
     pub end_anchor: Option<SegmentAnchor>,   // serde default: None
+    pub bend: f32,                           // serde default: 0 (straight)
+}
+
+impl SegGeom {
+    pub fn control(&self) -> Option<[f32; 2]>;
+    pub fn bend_point(&self) -> [f32; 2];
+    pub fn bend_toward(&self, p: [f32; 2]) -> f32;
+    pub fn points(&self, n: usize) -> Vec<[f32; 2]>;
 }
 ```
 
 A directed segment (line / arrow), world-space. An arrow's head sits at
-`(x2, y2)`. All three newer fields are serde-defaulted, so boards saved before
+`(x2, y2)`. All four newer fields are serde-defaulted, so boards saved before
 they existed keep loading.
 
 **Fields**
@@ -346,6 +354,13 @@ they existed keep loading.
 | `width` | `f32` | Stroke width, world units. |
 | `style` | [`SegmentStyle`](#segmentstyle) | Solid (default) or dashed stroke. |
 | `start_anchor`, `end_anchor` | `Option<SegmentAnchor>` | When set, the endpoint is BOUND to a shape's connector point and follows it as the shape moves/resizes/rotates; moving the segment itself detaches. Endpoints snap to hovered connector points while drawing. |
+| `bend` | `f32` | How far the line bows: the curve's middle sits `bend × length` off the straight line's middle (the sign picks the side). Relative to the length, so a bound curve keeps its shape as its shapes move. `0` = straight; omitted from JSON when 0. Drawn as a quadratic Bézier. |
+
+**Methods** — `control` is the curve's Bézier control point (`None` when
+straight); `bend_point` is the curve's middle, where the bend handle sits;
+`bend_toward(p)` is the `bend` that puts that middle nearest `p`; `points(n)`
+samples `n + 1` points along the line, ends included (just the two ends when
+straight).
 
 ---
 
@@ -668,7 +683,7 @@ normally never construct one.
 pub enum Tool {
     Pan, Select, Pen,
     Rect, Ellipse, Diamond, Triangle, RoundRect, Star, Hexagon,
-    Line, Arrow, DashedArrow, Text, Sticky, MindMap, Flowchart, Embed, Image,
+    Line, Arrow, DashedArrow, CurvedLine, CurvedArrow, CurvedDashedArrow, Text, Sticky, MindMap, Flowchart, Embed, Image,
 }
 ```
 

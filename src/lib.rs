@@ -125,6 +125,8 @@ const TEXT_SIZE: f32 = 18.0;
 /// Inset (world units) kept between a shape's inscribed text rectangle and its
 /// border, so the auto-shrunk label never touches the edge.
 const LABEL_PAD: f32 = 8.0;
+/// How much a curved-line tool bows a new line (see `SegGeom::bend`).
+const CURVED_TOOL_BEND: f32 = 0.2;
 
 /// Default highlighter color (packed `0xRRGGBBAA`) for the highlight toggle —
 /// translucent yellow so the text stays readable.
@@ -166,6 +168,9 @@ pub enum Tool {
     Line,
     Arrow,
     DashedArrow,
+    CurvedLine,
+    CurvedArrow,
+    CurvedDashedArrow,
     Text,
     /// Click to place a sticky note and type on it.
     Sticky,
@@ -195,6 +200,9 @@ impl Tool {
             Tool::Line => "╱",
             Tool::Arrow => "↗",
             Tool::DashedArrow => "⇢",
+            Tool::CurvedLine => "⌒",
+            Tool::CurvedArrow => "↷",
+            Tool::CurvedDashedArrow => "⤳",
             Tool::Text => "T",
             Tool::Sticky => "▤",
             Tool::MindMap => "◎",
@@ -221,6 +229,9 @@ impl Tool {
             Tool::Line => "Line (L)",
             Tool::Arrow => "Arrow (A)",
             Tool::DashedArrow => "Dashed arrow (K)",
+            Tool::CurvedLine => "Curved line",
+            Tool::CurvedArrow => "Curved arrow",
+            Tool::CurvedDashedArrow => "Curved dashed arrow",
             Tool::Text => "Text (T)",
             Tool::Sticky => "Sticky note (N)",
             Tool::MindMap => "Mind map (M)",
@@ -275,6 +286,9 @@ impl Tool {
         const LINE: &[u8] = include_bytes!("../assets/icons/line.svg");
         const ARROW: &[u8] = include_bytes!("../assets/icons/arrow.svg");
         const TEXT: &[u8] = include_bytes!("../assets/icons/text.svg");
+        const CURVE: &[u8] = include_bytes!("../assets/icons/curve.svg");
+        const CURVE_ARROW: &[u8] = include_bytes!("../assets/icons/curve-arrow.svg");
+        const CURVE_DASHED: &[u8] = include_bytes!("../assets/icons/curve-arrow-dashed.svg");
         const STICKY: &[u8] = include_bytes!("../assets/icons/sticky.svg");
         const MINDMAP: &[u8] = include_bytes!("../assets/icons/mindmap.svg");
         const FLOWCHART: &[u8] = include_bytes!("../assets/icons/flowchart.svg");
@@ -294,6 +308,9 @@ impl Tool {
             Tool::Line => Some(("wb-icon-line", LINE)),
             Tool::Arrow => Some(("wb-icon-arrow", ARROW)),
             Tool::DashedArrow => None,
+            Tool::CurvedLine => Some(("wb-icon-curve", CURVE)),
+            Tool::CurvedArrow => Some(("wb-icon-curve-arrow", CURVE_ARROW)),
+            Tool::CurvedDashedArrow => Some(("wb-icon-curve-arrow-dashed", CURVE_DASHED)),
             Tool::Text => Some(("wb-icon-text", TEXT)),
             Tool::Sticky => Some(("wb-icon-sticky", STICKY)),
             Tool::MindMap => Some(("wb-icon-mindmap", MINDMAP)),
@@ -332,7 +349,15 @@ impl ToolGroup {
                 Tool::Hexagon,
                 Tool::Star,
             ],
-            ToolGroup::Lines => &[Tool::Pen, Tool::Line, Tool::Arrow, Tool::DashedArrow],
+            ToolGroup::Lines => &[
+                Tool::Pen,
+                Tool::Line,
+                Tool::Arrow,
+                Tool::DashedArrow,
+                Tool::CurvedLine,
+                Tool::CurvedArrow,
+                Tool::CurvedDashedArrow,
+            ],
             ToolGroup::PagesImages => &[Tool::MindMap, Tool::Flowchart, Tool::Embed, Tool::Image],
         }
     }
@@ -626,7 +651,7 @@ struct GroupResizing {
 #[derive(Clone, Copy)]
 struct EndpointDrag {
     id: u64,
-    /// Which endpoint: 0 = (x1,y1), 1 = (x2,y2).
+    /// Which endpoint: 0 = (x1,y1), 1 = (x2,y2); 2 = the bend handle.
     which: usize,
 }
 
@@ -1459,6 +1484,7 @@ impl WhiteboardView {
                     style: SegmentStyle::Solid,
                     start_anchor: Some(start_anchor),
                     end_anchor: Some(end_anchor),
+                    bend: 0.0,
                 }),
                 stroke,
                 fill: None,
@@ -1573,6 +1599,7 @@ impl WhiteboardView {
                     style: SegmentStyle::Solid,
                     start_anchor: Some(start_anchor),
                     end_anchor: Some(end_anchor),
+                    bend: 0.0,
                 }),
                 stroke,
                 fill: None,
@@ -2202,6 +2229,7 @@ impl WhiteboardView {
                 style: SegmentStyle::Solid,
                 start_anchor: Some(start_anchor),
                 end_anchor: Some(end_anchor),
+                bend: 0.0,
             }),
             stroke: Some(0x2563ebff),
             fill: None,
@@ -3391,7 +3419,12 @@ impl WhiteboardView {
         }
 
         if let ElementKind::Line(s) | ElementKind::Arrow(s) = kind {
-            for (which, (wx, wy)) in [(s.x1, s.y1), (s.x2, s.y2)].into_iter().enumerate() {
+            // `which` 2 is the bend handle at the curve's middle.
+            let [bx, by] = s.bend_point();
+            for (which, (wx, wy)) in [(s.x1, s.y1), (s.x2, s.y2), (bx, by)]
+                .into_iter()
+                .enumerate()
+            {
                 if near(wx, wy, 0.0, 0.0) {
                     return Some(HandleGrab::Endpoint(EndpointDrag { id, which }));
                 }
@@ -3961,6 +3994,7 @@ impl WhiteboardView {
                             connector: cp.index,
                         }),
                         end_anchor: None,
+                        bend: 0.0,
                     }),
                 });
                 self.connecting = Some(ConnectDrag { from: cp });
@@ -4109,6 +4143,7 @@ impl WhiteboardView {
                 style: SegmentStyle::Solid,
                 start_anchor: None,
                 end_anchor: None,
+                bend: 0.0,
             }),
             Tool::Arrow => ElementKind::Arrow(SegGeom {
                 x1: anchor[0],
@@ -4119,6 +4154,7 @@ impl WhiteboardView {
                 style: SegmentStyle::Solid,
                 start_anchor: None,
                 end_anchor: None,
+                bend: 0.0,
             }),
             Tool::DashedArrow => ElementKind::Arrow(SegGeom {
                 x1: anchor[0],
@@ -4129,6 +4165,40 @@ impl WhiteboardView {
                 style: SegmentStyle::Dashed,
                 start_anchor: None,
                 end_anchor: None,
+                bend: 0.0,
+            }),
+            Tool::CurvedLine => ElementKind::Line(SegGeom {
+                x1: anchor[0],
+                y1: anchor[1],
+                x2: anchor[0],
+                y2: anchor[1],
+                width,
+                style: SegmentStyle::Solid,
+                start_anchor: None,
+                end_anchor: None,
+                bend: CURVED_TOOL_BEND,
+            }),
+            Tool::CurvedArrow => ElementKind::Arrow(SegGeom {
+                x1: anchor[0],
+                y1: anchor[1],
+                x2: anchor[0],
+                y2: anchor[1],
+                width,
+                style: SegmentStyle::Solid,
+                start_anchor: None,
+                end_anchor: None,
+                bend: CURVED_TOOL_BEND,
+            }),
+            Tool::CurvedDashedArrow => ElementKind::Arrow(SegGeom {
+                x1: anchor[0],
+                y1: anchor[1],
+                x2: anchor[0],
+                y2: anchor[1],
+                width,
+                style: SegmentStyle::Dashed,
+                start_anchor: None,
+                end_anchor: None,
+                bend: CURVED_TOOL_BEND,
             }),
             // These tools don't create a drag-element here (handled earlier).
             Tool::Pan
@@ -4577,6 +4647,21 @@ impl WhiteboardView {
         }
         // Dragging a line/arrow endpoint (Shift snaps the angle to 45°, Option
         // snaps the endpoint to the grid).
+        if let Some(ep) = self.endpoint
+            && ep.which == 2
+        {
+            // The bend handle: the curve's middle follows the pointer; near
+            // the straight line it snaps straight.
+            let cur = self.event_to_world(ev.position);
+            if let Some(e) = self.scene.elements.iter_mut().find(|e| e.id == ep.id)
+                && let ElementKind::Line(s) | ElementKind::Arrow(s) = &mut e.kind
+            {
+                let bend = s.bend_toward(cur);
+                s.bend = if bend.abs() < 0.03 { 0.0 } else { bend };
+            }
+            cx.notify();
+            return;
+        }
         if let Some(ep) = self.endpoint {
             let cur = self.event_to_world(ev.position);
             let shift = ev.modifiers.shift;
@@ -8237,6 +8322,7 @@ mod tests {
                         style: SegmentStyle::Solid,
                         start_anchor: None,
                         end_anchor: None,
+                        bend: 0.0,
                     }),
                     stroke: None,
                     fill: None,
@@ -8527,6 +8613,7 @@ mod tests {
             style: SegmentStyle::Solid,
             start_anchor: None,
             end_anchor: None,
+            bend: 0.0,
         });
         assert_eq!(bbox(&k), (0.0, 0.0, 10.0, 4.0));
         translate(&mut k, 5.0, -2.0);
@@ -8720,6 +8807,7 @@ mod tests {
             style: SegmentStyle::Solid,
             start_anchor: None,
             end_anchor: None,
+            bend: 0.0,
         });
         rotate_element(&mut seg, 0.0, 0.0, FRAC_PI_2);
         match seg {
@@ -9861,6 +9949,47 @@ mod board_tests {
         // Clicking the first box ticks it.
         click(&mut cx, at(x + 4.0, y + 6.0));
         assert_eq!(text(&mut cx).0, "☑ milk\n☐ eggs\n• tea");
+    }
+
+    #[gpui::test]
+    fn curved_tools_and_the_bend_handle(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        let seg = |cx: &mut VisualTestContext, i: usize| match elements(&v, cx)[i].kind {
+            ElementKind::Line(s) | ElementKind::Arrow(s) => s,
+            _ => panic!("a segment"),
+        };
+        // A curved arrow is born bent, and its bounds take in the bulge.
+        v.update(&mut cx, |b, cx| b.set_tool(Tool::CurvedArrow, cx));
+        drag(&mut cx, at(100.0, 400.0), at(300.0, 400.0));
+        let s = seg(&mut cx, 0);
+        assert_eq!(s.bend, CURVED_TOOL_BEND);
+        let (_, _, _, max_y) = crate::geometry::bbox(&elements(&v, &cx)[0].kind);
+        assert!(max_y > 430.0, "bounds include the curve: {max_y}");
+        // A straight line bends by dragging its middle handle…
+        cx.simulate_keystrokes("l");
+        drag(&mut cx, at(100.0, 200.0), at(300.0, 200.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(150.0, 200.0));
+        drag(&mut cx, at(200.0, 200.0), at(200.0, 150.0));
+        let s = seg(&mut cx, 1);
+        assert!(
+            (s.bend + 0.25).abs() < 0.02,
+            "bent toward the pointer: {}",
+            s.bend
+        );
+        let mid = s.bend_point();
+        assert!((mid[1] - 150.0).abs() < 2.0, "the curve passes the pointer");
+        // …and snaps back straight near the line.
+        drag(&mut cx, at(mid[0], mid[1]), at(200.0, 202.0));
+        assert_eq!(seg(&mut cx, 1).bend, 0.0);
+        // Exports draw it as a curve.
+        let svg = v.read_with(&cx, |b, _| {
+            b.scene()
+                .to_drawing(&b.font, gpui::black())
+                .unwrap()
+                .to_svg(None, |_| None)
+        });
+        assert!(svg.contains('Q'), "a quadratic curve in the SVG");
     }
 
     #[gpui::test]
