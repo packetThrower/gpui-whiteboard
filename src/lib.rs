@@ -4941,7 +4941,9 @@ impl WhiteboardView {
                         .font
                         .caret_pos_wrapped(&tg.content, tg.size, tg.wrap, at + 3);
                     let slop = tg.size * 0.15;
-                    (lx >= a[0] - slop && lx <= b[0] + slop && ly >= a[1] && ly <= a[1] + lh)
+                    // In a right-to-left line the box's leading edge is its right.
+                    let (x0, x1) = (a[0].min(b[0]), a[0].max(b[0]));
+                    (lx >= x0 - slop && lx <= x1 + slop && ly >= a[1] && ly <= a[1] + lh)
                         .then_some((e.id, at + lead))
                 })
         })

@@ -27,6 +27,10 @@ log = "0.4"
 # lockfile unifies to a single copy. The default face (JetBrains Mono, OFL) is
 # bundled under `assets/`.
 ttf-parser = "0.25"
+# Shaping (Arabic joining, marks) and bidi reordering for that text. Both are
+# already in gpui's tree (via usvg); rustybuzz 0.20 is the ttf-parser 0.25 one.
+rustybuzz = "0.20"
+unicode-bidi = "0.3"
 
 [dev-dependencies]
 gpui = { package = "gpui-pre", version = "0.3.12", features = ["test-support"] }

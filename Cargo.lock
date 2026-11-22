@@ -1307,9 +1307,11 @@ version = "0.6.2"
 dependencies = [
  "gpui-pre",
  "log",
+ "rustybuzz",
  "serde",
  "serde_json",
  "ttf-parser",
+ "unicode-bidi",
 ]
 
 [[package]]

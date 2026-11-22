@@ -113,6 +113,27 @@ fn fontconfig_face(ch: char) -> Option<(&'static ttf_parser::Face<'static>, ttf_
     hit
 }
 
+/// Which of a [`Faces`]' faces a glyph comes from.
+#[derive(Clone, Copy, Debug)]
+enum FaceId {
+    Primary,
+    Fallback(usize),
+    #[cfg(all(unix, not(target_os = "macos")))]
+    System(&'static ttf_parser::Face<'static>),
+}
+
+impl PartialEq for FaceId {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Primary, Self::Primary) => true,
+            (Self::Fallback(a), Self::Fallback(b)) => a == b,
+            #[cfg(all(unix, not(target_os = "macos")))]
+            (Self::System(a), Self::System(b)) => std::ptr::eq(*a, *b),
+            _ => false,
+        }
+    }
+}
+
 /// A font's face plus the system fallbacks (parsed on first use), so a layout
 /// draws each char from the first face that has it. Metrics (ascent, line
 /// height) stay the primary face's.
@@ -122,31 +143,169 @@ struct Faces<'a> {
 }
 
 impl<'a> Faces<'a> {
-    /// The face that has `ch`, its glyph, and its units → world scale at
-    /// `font_size`; the primary's `.notdef` when no face has it.
-    fn glyph(&self, ch: char, font_size: f32) -> (&ttf_parser::Face<'a>, ttf_parser::GlyphId, f32) {
-        let scale = |f: &ttf_parser::Face| {
-            let upem = f.units_per_em() as f32;
-            if upem > 0.0 { font_size / upem } else { 0.0 }
-        };
+    fn get(&self, id: FaceId) -> &ttf_parser::Face<'a> {
+        match id {
+            FaceId::Primary => &self.primary,
+            FaceId::Fallback(i) => self.fallbacks[i]
+                .get_or_init(|| fallback_face(i))
+                .as_ref()
+                .unwrap_or(&self.primary),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            FaceId::System(f) => f,
+        }
+    }
+
+    /// The face that has `ch` and its glyph; the primary's `.notdef` when no
+    /// face has it.
+    fn glyph(&self, ch: char) -> (FaceId, ttf_parser::GlyphId) {
         if let Some(g) = self.primary.glyph_index(ch) {
-            return (&self.primary, g, scale(&self.primary));
+            return (FaceId::Primary, g);
         }
         if !ch.is_whitespace() && !ch.is_control() {
-            for (i, cell) in self.fallbacks.iter().enumerate() {
-                if let Some(f) = cell.get_or_init(|| fallback_face(i))
-                    && let Some(g) = f.glyph_index(ch)
-                {
-                    return (f, g, scale(f));
+            for i in 0..self.fallbacks.len() {
+                // An absent fallback resolves to the primary, which lacks `ch`.
+                if let Some(g) = self.get(FaceId::Fallback(i)).glyph_index(ch) {
+                    return (FaceId::Fallback(i), g);
                 }
             }
             #[cfg(all(unix, not(target_os = "macos")))]
             if let Some((f, g)) = fontconfig_face(ch) {
-                return (f, g, scale(f));
+                return (FaceId::System(f), g);
             }
         }
-        (&self.primary, ttf_parser::GlyphId(0), scale(&self.primary))
+        (FaceId::Primary, ttf_parser::GlyphId(0))
     }
+}
+
+/// A face's units → world scale at `font_size`.
+fn scale_of(face: &ttf_parser::Face, font_size: f32) -> f32 {
+    let upem = face.units_per_em() as f32;
+    if upem > 0.0 { font_size / upem } else { 0.0 }
+}
+
+/// Whether a run with `ch` needs the shaper: combining marks and the scripts
+/// whose letters change form or order (Arabic, Hebrew points, Indic, Thai…).
+/// ponytail: a block list, not script data; Latin, Greek, Cyrillic and CJK
+/// skip shaping, so they keep the plain cmap path (and no code ligatures).
+fn needs_shaping(ch: char) -> bool {
+    matches!(ch as u32, 0x0300..=0x036F | 0x0483..=0x0489 | 0x0590..=0x1DFF | 0x200C..=0x200D | 0x20D0..=0x20FF | 0xA800..=0xABFF | 0xFB1D..=0xFDFF | 0xFE20..=0xFE2F | 0xFE70..=0xFEFF)
+}
+
+/// One shaped glyph: its face and id, the content byte its cluster starts at,
+/// and its advance and offsets in world units (offsets y-up).
+#[derive(Clone, Copy, Debug)]
+struct Glyph {
+    face: FaceId,
+    id: ttf_parser::GlyphId,
+    cluster: usize,
+    adv: f32,
+    dx: f32,
+    dy: f32,
+}
+
+/// A run of one face and one direction: its content byte range and its glyphs
+/// in visual (left-to-right) order.
+struct Run {
+    range: std::ops::Range<usize>,
+    glyphs: Vec<Glyph>,
+}
+
+/// Shape the `range` of `line` (content byte offset `base`) in one face and
+/// direction.
+fn shape_run(
+    faces: &Faces,
+    line: &str,
+    base: usize,
+    range: std::ops::Range<usize>,
+    (face, rtl): (FaceId, bool),
+    font_size: f32,
+) -> Run {
+    let f = faces.get(face);
+    let scale = scale_of(f, font_size);
+    let text = &line[range.clone()];
+    let at = base + range.start;
+    let glyphs = if rtl || text.chars().any(needs_shaping) {
+        let hb = rustybuzz::Face::from_face(f.clone());
+        let mut buf = rustybuzz::UnicodeBuffer::new();
+        buf.push_str(text);
+        buf.guess_segment_properties();
+        buf.set_direction(if rtl {
+            rustybuzz::Direction::RightToLeft
+        } else {
+            rustybuzz::Direction::LeftToRight
+        });
+        let out = rustybuzz::shape(&hb, &[], buf);
+        out.glyph_infos()
+            .iter()
+            .zip(out.glyph_positions())
+            .map(|(i, p)| Glyph {
+                face,
+                id: ttf_parser::GlyphId(i.glyph_id as u16),
+                cluster: at + i.cluster as usize,
+                adv: p.x_advance as f32 * scale,
+                dx: p.x_offset as f32 * scale,
+                dy: p.y_offset as f32 * scale,
+            })
+            .collect()
+    } else {
+        text.char_indices()
+            .map(|(i, ch)| {
+                let id = f.glyph_index(ch).unwrap_or(ttf_parser::GlyphId(0));
+                Glyph {
+                    face,
+                    id,
+                    cluster: at + i,
+                    adv: f.glyph_hor_advance(id).unwrap_or(0) as f32 * scale,
+                    dx: 0.0,
+                    dy: 0.0,
+                }
+            })
+            .collect()
+    };
+    Run {
+        range: at..base + range.end,
+        glyphs,
+    }
+}
+
+/// Split a hard line into face × direction runs and shape each. A char that
+/// isn't a letter (space, punctuation, digit, mark) stays in the current face
+/// when that face has it, so a word's spaces and marks shape with it.
+fn shape_line(
+    faces: &Faces,
+    line: &str,
+    base: usize,
+    levels: &[unicode_bidi::Level],
+    font_size: f32,
+) -> Vec<Run> {
+    let mut runs = Vec::new();
+    let mut cur: Option<(FaceId, bool)> = None;
+    let mut start = 0;
+    for (i, ch) in line.char_indices() {
+        let rtl = levels[i].is_rtl();
+        let face = match cur {
+            Some((f, _)) if !ch.is_alphabetic() && faces.get(f).glyph_index(ch).is_some() => f,
+            _ => faces.glyph(ch).0,
+        };
+        if cur != Some((face, rtl)) {
+            if let Some(c) = cur {
+                runs.push(shape_run(faces, line, base, start..i, c, font_size));
+            }
+            start = i;
+            cur = Some((face, rtl));
+        }
+    }
+    if let Some(c) = cur {
+        runs.push(shape_run(
+            faces,
+            line,
+            base,
+            start..line.len(),
+            c,
+            font_size,
+        ));
+    }
+    runs
 }
 
 /// Floor for shape-label auto-shrink (world units): a label never shrinks below
@@ -290,53 +449,13 @@ impl Font {
         font_size: f32,
         max_width: Option<f32>,
     ) -> TextLayout {
-        let Some(faces) = self.faces() else {
-            return TextLayout {
-                segs: Vec::new(),
-                width: 0.0,
-                height: font_size,
-                line_height: font_size,
-                caret: [0.0, 0.0],
-            };
-        };
-        let face = &faces.primary;
-        let upem = face.units_per_em() as f32;
-        let scale = if upem > 0.0 { font_size / upem } else { 0.0 };
-        let ascent = face.ascender() as f32 * scale;
-        let (lines, line_height) = self.line_stops(content, font_size, max_width);
-
-        let mut segs = Vec::new();
-        let mut width = 0.0_f32;
-        // `line_stops` always yields ≥1 visual line, so "" is one empty line and
-        // a trailing newline yields a final empty line holding the caret.
-        for line in &lines {
-            let lstart = line.stops.first().map_or(0, |&(b, _)| b);
-            let lend = line.stops.last().map_or(lstart, |&(b, _)| b);
-            let baseline = line.top + ascent;
-            for (k, ch) in content.get(lstart..lend).unwrap_or("").chars().enumerate() {
-                let pen = line.stops.get(k).map_or(0.0, |&(_, x)| x);
-                let (gface, gid, scale) = faces.glyph(ch, font_size);
-                let mut b = Outliner {
-                    segs: &mut segs,
-                    pen,
-                    baseline,
-                    scale,
-                    shear: 0.0,
-                };
-                gface.outline_glyph(gid, &mut b);
-            }
-            width = width.max(line.stops.last().map_or(0.0, |&(_, x)| x));
-        }
-        let caret = lines.last().map_or([0.0, 0.0], |l| {
-            let &(_, x) = l.stops.last().unwrap();
-            [x, l.top]
-        });
+        let l = self.layout_styled(content, font_size, max_width, |_| GlyphStyle::default());
         TextLayout {
-            segs,
-            width,
-            height: lines.len().max(1) as f32 * line_height,
-            line_height,
-            caret,
+            segs: l.segs,
+            width: l.width,
+            height: l.height,
+            line_height: l.line_height,
+            caret: l.caret,
         }
     }
 
@@ -365,10 +484,7 @@ impl Font {
                 caret: [0.0, 0.0],
             };
         };
-        let face = &faces.primary;
-        let upem = face.units_per_em() as f32;
-        let scale = if upem > 0.0 { font_size / upem } else { 0.0 };
-        let ascent = face.ascender() as f32 * scale;
+        let ascent = faces.primary.ascender() as f32 * scale_of(&faces.primary, font_size);
         let (lines, line_height) = self.line_stops(content, font_size, max_width);
 
         const SHEAR: f32 = 0.22; // ~12° oblique
@@ -379,31 +495,26 @@ impl Font {
         // doubled fill would cancel under even-odd winding → hollow glyphs.
         let mut bold_segs = Vec::new();
         let mut decorations = Vec::new();
-        let mut width = 0.0_f32;
         for line in &lines {
-            let lstart = line.stops.first().map_or(0, |&(b, _)| b);
-            let lend = line.stops.last().map_or(lstart, |&(b, _)| b);
             let baseline = line.top + ascent;
             // The current decoration run: its style and starting local x. Only the
             // underline/strike/highlight bits matter (bold/italic are glyph-baked).
+            // Walked in visual order, so a run is one contiguous stretch of x.
             let mut run: Option<(GlyphStyle, f32)> = None;
-            let mut byte = lstart;
-            for (k, ch) in content.get(lstart..lend).unwrap_or("").chars().enumerate() {
-                let st = style_at(byte);
-                let pen = line.stops.get(k).map_or(0.0, |&(_, x)| x);
-                let (gface, gid, scale) = faces.glyph(ch, font_size);
-                let shear = if st.italic { SHEAR } else { 0.0 };
+            for g in &line.glyphs {
+                let st = style_at(g.cluster);
+                let face = faces.get(g.face);
                 let start = segs.len();
-                {
-                    let mut b = Outliner {
+                face.outline_glyph(
+                    g.id,
+                    &mut Outliner {
                         segs: &mut segs,
-                        pen,
-                        baseline,
-                        scale,
-                        shear,
-                    };
-                    gface.outline_glyph(gid, &mut b);
-                }
+                        pen: g.x + g.dx,
+                        baseline: baseline - g.dy,
+                        scale: scale_of(face, font_size),
+                        shear: if st.italic { SHEAR } else { 0.0 },
+                    },
+                );
                 if st.bold {
                     bold_segs.extend_from_slice(&segs[start..]);
                 }
@@ -421,19 +532,18 @@ impl Font {
                             &mut decorations,
                             rs,
                             x0,
-                            pen,
+                            g.x,
                             line.top,
                             line_height,
                             baseline,
                             bar,
                         );
                     }
-                    run = has_deco.then_some((deco, pen));
+                    run = has_deco.then_some((deco, g.x));
                 }
-                byte += ch.len_utf8();
             }
             if let Some((rs, x0)) = run.take() {
-                let x1 = line.stops.last().map_or(x0, |&(_, x)| x);
+                let x1 = line.glyphs.last().map_or(x0, |g| g.x + g.adv);
                 flush_deco(
                     &mut decorations,
                     rs,
@@ -445,21 +555,16 @@ impl Font {
                     bar,
                 );
             }
-            width = width.max(line.stops.last().map_or(0.0, |&(_, x)| x));
         }
-        let caret = lines.last().map_or([0.0, 0.0], |l| {
-            let &(_, x) = l.stops.last().unwrap();
-            [x, l.top]
-        });
         StyledLayout {
             segs,
             bold_segs,
             bold_width: font_size * 0.06,
             decorations,
-            width,
+            width: lines.iter().fold(0.0, |m, l| m.max(l.width)),
             height: lines.len().max(1) as f32 * line_height,
             line_height,
-            caret,
+            caret: end_caret(&lines),
         }
     }
 
@@ -478,9 +583,7 @@ impl Font {
         max_width: Option<f32>,
     ) -> (f32, f32) {
         let (lines, line_height) = self.line_stops(content, font_size, max_width);
-        let width = lines.iter().fold(0.0_f32, |m, l| {
-            m.max(l.stops.last().map_or(0.0, |&(_, x)| x))
-        });
+        let width = lines.iter().fold(0.0_f32, |m, l| m.max(l.width));
         (width, lines.len().max(1) as f32 * line_height)
     }
 
@@ -512,15 +615,18 @@ impl Font {
         lo
     }
 
-    /// Per-visual-line caret stops for `content`. Lines break on `'\n'` always
-    /// and, when `max_width` is `Some(w)` (world units), also wrap greedily at
-    /// word boundaries so each visual line stays within `w`; a single word wider
-    /// than `w` is split between characters so it never overflows. For every
-    /// visual line: the content **byte offset** and local x of each caret
-    /// position (before each char and after the last), plus the line's top y.
-    /// Soft wraps consume no byte, so offsets stay contiguous across visual
-    /// lines. The backbone of caret placement, click hit-testing, and selection
-    /// rects. Byte offsets index into `content`.
+    /// Per-visual-line glyphs and caret stops for `content`. Lines break on
+    /// `'\n'` always and, when `max_width` is `Some(w)` (world units), also wrap
+    /// greedily at word boundaries so each visual line stays within `w`; a single
+    /// word wider than `w` is split between clusters so it never overflows.
+    ///
+    /// Each hard line is one bidi paragraph (direction from its first strong
+    /// char): it's shaped in face × direction runs, wrapped in logical order,
+    /// then each visual line is reordered (UAX #9 L2) and its glyphs placed left
+    /// to right. Lines of a right-to-left paragraph align to the block's right
+    /// edge. Soft wraps consume no byte, so offsets stay contiguous across
+    /// visual lines. The backbone of drawing, caret placement, click
+    /// hit-testing, and selection rects. Byte offsets index into `content`.
     fn line_stops(
         &self,
         content: &str,
@@ -532,82 +638,86 @@ impl Font {
                 vec![LineStops {
                     top: 0.0,
                     stops: vec![(0, 0.0)],
+                    glyphs: Vec::new(),
+                    width: 0.0,
+                    rtl: false,
                 }],
                 font_size,
             );
         };
-        let face = &faces.primary;
-        let upem = face.units_per_em() as f32;
-        let scale = if upem > 0.0 { font_size / upem } else { 0.0 };
-        let line_height = Self::line_height_of(face, scale);
+        let line_height = Self::line_height_of(&faces.primary, scale_of(&faces.primary, font_size));
         let wrap = max_width.filter(|w| *w > 0.0);
 
         let mut lines = Vec::new();
-        let mut byte = 0usize;
+        let mut base = 0usize;
         let mut top = 0.0_f32;
         for line in content.split('\n') {
-            // Flat caret stops for the whole hard line (x cumulative from its
-            // start), plus whether each char is a space (a wrap opportunity).
-            let mut flat: Vec<(usize, f32)> = Vec::with_capacity(line.len() + 1);
-            let mut space_after: Vec<bool> = Vec::with_capacity(line.len());
+            let bidi = unicode_bidi::ParagraphBidiInfo::new(line, None);
+            let runs = shape_line(&faces, line, base, &bidi.levels, font_size);
+            // Logical cluster starts (line-relative) and their advances, for wrapping.
+            let mut adv = vec![None::<f32>; line.len()];
+            for g in runs.iter().flat_map(|r| &r.glyphs) {
+                *adv[g.cluster - base].get_or_insert(0.0) += g.adv;
+            }
+            // Caret stops at cluster starts (x cumulative from the line's start,
+            // logical order), plus whether each cluster ends in a space.
+            let mut flat: Vec<(usize, f32)> = Vec::new();
+            let mut space_after: Vec<bool> = Vec::new();
             let mut pen = 0.0_f32;
-            let mut b = byte;
-            flat.push((b, 0.0));
-            for ch in line.chars() {
-                let (gface, gid, gscale) = faces.glyph(ch, font_size);
-                pen += gface.glyph_hor_advance(gid).unwrap_or(0) as f32 * gscale;
-                b += ch.len_utf8();
-                flat.push((b, pen));
-                space_after.push(ch == ' ');
-            }
-
-            match wrap {
-                // No wrapping: the whole hard line is one visual line.
-                None => {
-                    lines.push(LineStops { top, stops: flat });
-                    top += line_height;
-                }
-                // Greedy word-wrap of `flat` into visual segments ≤ `w`.
-                Some(w) => {
-                    let n = flat.len();
-                    let mut s = 0usize; // segment start index into `flat`
-                    let mut e = 1usize; // current end index
-                    let mut last_break: Option<usize> = None; // index just past a space
-                    while e < n {
-                        if flat[e].1 - flat[s].1 > w && e - s > 1 {
-                            // Break at the last space if any, else split the word.
-                            let brk = match last_break {
-                                Some(lb) if lb > s => lb,
-                                _ => e - 1,
-                            };
-                            let base = flat[s].1;
-                            lines.push(LineStops {
-                                top,
-                                stops: flat[s..=brk]
-                                    .iter()
-                                    .map(|&(by, x)| (by, x - base))
-                                    .collect(),
-                            });
-                            top += line_height;
-                            s = brk;
-                            e = s + 1;
-                            last_break = None;
-                            continue;
-                        }
-                        if space_after.get(e - 1).copied().unwrap_or(false) {
-                            last_break = Some(e);
-                        }
-                        e += 1;
+            for (i, a) in adv.iter().enumerate() {
+                if let Some(a) = a {
+                    if !flat.is_empty() {
+                        space_after.push(line[..i].ends_with(' '));
                     }
-                    let base = flat[s].1;
-                    lines.push(LineStops {
-                        top,
-                        stops: flat[s..n].iter().map(|&(by, x)| (by, x - base)).collect(),
-                    });
-                    top += line_height;
+                    flat.push((i, pen));
+                    pen += a;
                 }
             }
-            byte += line.len() + 1; // +1 for the '\n' (harmless past the last line)
+            if !flat.is_empty() {
+                space_after.push(line.ends_with(' '));
+            }
+            flat.push((line.len(), pen));
+
+            // Greedy word-wrap of `flat` into visual segments ≤ `w`.
+            let mut segments = Vec::new();
+            let n = flat.len();
+            let mut s = 0usize; // segment start index into `flat`
+            if let Some(w) = wrap {
+                let mut e = 1usize; // current end index
+                let mut last_break: Option<usize> = None; // index just past a space
+                while e < n {
+                    if flat[e].1 - flat[s].1 > w && e - s > 1 {
+                        // Break at the last space if any, else split the word.
+                        let brk = match last_break {
+                            Some(lb) if lb > s => lb,
+                            _ => e - 1,
+                        };
+                        segments.push(flat[s].0..flat[brk].0);
+                        s = brk;
+                        e = s + 1;
+                        last_break = None;
+                        continue;
+                    }
+                    if space_after.get(e - 1).copied().unwrap_or(false) {
+                        last_break = Some(e);
+                    }
+                    e += 1;
+                }
+            }
+            segments.push(flat[s].0..line.len());
+
+            for seg in segments {
+                lines.push(visual_line(content, &bidi, &runs, base, seg, top));
+                top += line_height;
+            }
+            base += line.len() + 1; // +1 for the '\n' (harmless past the last line)
+        }
+        // A right-to-left paragraph's lines hug the block's right edge.
+        let width = lines.iter().fold(0.0_f32, |m, l| m.max(l.width));
+        for l in lines.iter_mut().filter(|l| l.rtl) {
+            let shift = width - l.width;
+            l.glyphs.iter_mut().for_each(|g| g.x += shift);
+            l.stops.iter_mut().for_each(|s| s.1 += shift);
         }
         (lines, line_height)
     }
@@ -711,34 +821,155 @@ impl Font {
         let mut rects = Vec::new();
         for line in &lines {
             let lstart = line.stops[0].0;
-            let lend = line.stops[line.stops.len() - 1].0;
+            let (lend, end_x) = line.stops[line.stops.len() - 1];
             if end <= lstart || start > lend {
                 continue; // selection doesn't touch this line
             }
-            let x_at = |byte: usize| {
-                line.stops
-                    .iter()
-                    .find(|(b, _)| *b == byte)
-                    .map_or(0.0, |(_, x)| *x)
-            };
-            let x0 = x_at(start.max(lstart));
-            let x1 = x_at(end.min(lend));
+            // The selected glyphs' spans, merged where they touch — a logical
+            // range can split into several stretches across a direction change.
+            let mut spans: Vec<(f32, f32)> = line
+                .glyphs
+                .iter()
+                .filter(|g| (start..end).contains(&g.cluster))
+                .map(|g| (g.x, g.x + g.adv))
+                .collect();
             // The newline (and anything below) is selected when `end` runs past
             // this line — show a stub so an end-of-line/empty-line selection reads.
-            let w = (x1 - x0).max(if end > lend { stub } else { 0.0 });
-            if w > 0.0 {
-                rects.push([x0, line.top, w, line_height]);
+            if spans.is_empty() && end > lend {
+                spans.push(if line.rtl {
+                    (end_x - stub, end_x)
+                } else {
+                    (end_x, end_x + stub)
+                });
+            }
+            let mut merged: Vec<(f32, f32)> = Vec::new();
+            for (x0, x1) in spans {
+                match merged.last_mut() {
+                    Some(m) if x0 <= m.1 + 0.01 => m.1 = m.1.max(x1),
+                    _ => merged.push((x0, x1)),
+                }
+            }
+            for (x0, x1) in merged {
+                if x1 > x0 {
+                    rects.push([x0, line.top, x1 - x0, line_height]);
+                }
             }
         }
         rects
     }
 }
 
-/// One line's caret stops: its top y and `(content byte offset, local x)` at each
-/// caret position (before each char and after the last). See [`Font::line_stops`].
+/// One visual line: its top y, its glyphs placed left to right, and the
+/// `(content byte offset, local x)` caret stop at every char boundary in
+/// logical order (the first and last are the line's start and end). A stop's x
+/// is the *leading* edge of the char after it in reading order (the right edge
+/// for right-to-left text); the line end's is the trailing edge of its
+/// logically last char. See [`Font::line_stops`].
 struct LineStops {
     top: f32,
     stops: Vec<(usize, f32)>,
+    glyphs: Vec<Placed>,
+    /// Total advance of the line's glyphs.
+    width: f32,
+    /// Whether the line's paragraph runs right to left.
+    rtl: bool,
+}
+
+/// A shaped glyph placed on a line: `x` is the start of its advance.
+#[derive(Clone, Copy, Debug)]
+struct Placed {
+    face: FaceId,
+    id: ttf_parser::GlyphId,
+    cluster: usize,
+    x: f32,
+    adv: f32,
+    dx: f32,
+    dy: f32,
+    rtl: bool,
+}
+
+/// Lay out the visual line `seg` (line-relative bytes) of the hard line that
+/// starts at content byte `base`: reorder its runs (UAX #9 L1–L2), place the
+/// glyphs left to right, and derive the caret stops.
+fn visual_line(
+    content: &str,
+    bidi: &unicode_bidi::ParagraphBidiInfo,
+    runs: &[Run],
+    base: usize,
+    seg: std::ops::Range<usize>,
+    top: f32,
+) -> LineStops {
+    let mut glyphs = Vec::new();
+    let mut pen = 0.0_f32;
+    if !seg.is_empty() {
+        let (levels, vruns) = bidi.visual_runs(seg.clone());
+        for vr in vruns {
+            let rtl = levels[vr.start].is_rtl();
+            let abs = base + vr.start..base + vr.end;
+            let mut parts: Vec<&Run> = runs
+                .iter()
+                .filter(|r| r.range.start < abs.end && abs.start < r.range.end)
+                .collect();
+            if rtl {
+                parts.reverse();
+            }
+            for g in parts.iter().flat_map(|r| &r.glyphs) {
+                if abs.contains(&g.cluster) {
+                    glyphs.push(Placed {
+                        face: g.face,
+                        id: g.id,
+                        cluster: g.cluster,
+                        x: pen,
+                        adv: g.adv,
+                        dx: g.dx,
+                        dy: g.dy,
+                        rtl,
+                    });
+                    pen += g.adv;
+                }
+            }
+        }
+    }
+    // Clusters: (start byte, left x, right x, rtl), in logical order.
+    let mut clusters: Vec<(usize, f32, f32, bool)> = Vec::new();
+    for g in &glyphs {
+        match clusters.last_mut() {
+            Some(c) if c.0 == g.cluster => c.2 = g.x + g.adv,
+            _ => clusters.push((g.cluster, g.x, g.x + g.adv, g.rtl)),
+        }
+    }
+    clusters.sort_by_key(|c| c.0);
+    let end = base + seg.end;
+    let mut stops = Vec::with_capacity(seg.len() + 1);
+    let mut trailing = 0.0;
+    for (k, &(b, x0, x1, rtl)) in clusters.iter().enumerate() {
+        let (lead, trail) = if rtl { (x1, x0) } else { (x0, x1) };
+        let next = clusters.get(k + 1).map_or(end, |c| c.0);
+        // Boundaries inside a multi-char cluster (a ligature, a base + marks)
+        // split it evenly.
+        let chars = content[b..next].char_indices().map(|(i, _)| b + i);
+        let n = content[b..next].chars().count() as f32;
+        for (j, at) in chars.enumerate() {
+            stops.push((at, lead + (trail - lead) * j as f32 / n));
+        }
+        trailing = trail;
+    }
+    stops.push((end, trailing));
+    LineStops {
+        top,
+        stops,
+        glyphs,
+        width: pen,
+        rtl: bidi.paragraph_level.is_rtl(),
+    }
+}
+
+/// The caret just past the content: the last line's last stop.
+fn end_caret(lines: &[LineStops]) -> [f32; 2] {
+    lines.last().map_or([0.0, 0.0], |l| {
+        let &(_, x) = l.stops.last().unwrap();
+        [x, l.top]
+    })
 }
 
 /// The renderable style of one character — what [`Font::layout_styled`] needs.
@@ -883,12 +1114,83 @@ mod tests {
         let font = Font::from_bytes(DEFAULT_FONT.to_vec(), 0).unwrap();
         let faces = font.faces().unwrap();
         for ch in ['가', 'א', 'ب', '東'] {
-            assert_ne!(faces.glyph(ch, 16.0).1, ttf_parser::GlyphId(0), "{ch}");
+            assert_ne!(faces.glyph(ch).1, ttf_parser::GlyphId(0), "{ch}");
         }
-        assert!(std::ptr::eq(faces.glyph('a', 16.0).0, &faces.primary));
+        assert_eq!(faces.glyph('a').0, FaceId::Primary);
     }
 
     use super::*;
+
+    /// Arabic letters take their joined forms (initial, medial, final differ)
+    /// and read right to left, from the system Arabic fallback.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn arabic_is_shaped_and_joined() {
+        let f = Font::from_bytes(DEFAULT_FONT.to_vec(), 0).unwrap();
+        let (lines, _) = f.line_stops("ببب", 20.0, None);
+        assert!(lines[0].glyphs.iter().all(|g| g.rtl));
+        // The letters (a face may add the dots as zero-advance marks).
+        let g: Vec<_> = lines[0].glyphs.iter().filter(|g| g.adv > 0.0).collect();
+        assert_eq!(g.len(), 3, "{g:?}");
+        let isolated = f.faces().unwrap().glyph('ب').1;
+        assert!(g.iter().all(|g| g.id != isolated), "{g:?}");
+        assert!(g[0].id != g[1].id && g[1].id != g[2].id, "{g:?}");
+        // Visual order is reversed: the logically first letter draws rightmost.
+        assert_eq!(
+            g.iter().map(|g| g.cluster).collect::<Vec<_>>(),
+            vec![4, 2, 0]
+        );
+    }
+
+    /// A Hebrew run inside a Latin line reads right to left, and every caret
+    /// stop has its own x that a click there gives back.
+    #[test]
+    fn mixed_line_orders_runs_and_caret() {
+        let f = Font::from_bytes(DEFAULT_FONT.to_vec(), 0).unwrap();
+        let s = "abc אבג"; // א at byte 4, ב 6, ג 8, end 10
+        let x = |b| f.caret_pos(s, 20.0, b)[0];
+        assert!(x(0) < x(1) && x(1) < x(2) && x(2) < x(3));
+        assert!(
+            x(4) > x(6) && x(6) > x(8) && x(8) > x(3),
+            "{:?}",
+            [4, 6, 8, 10].map(x)
+        );
+        assert!(
+            (x(4) - f.measure(s, 20.0).0).abs() < 0.01,
+            "alef leads at the right end"
+        );
+        for b in [0, 1, 2, 3, 4, 6, 8, 10] {
+            assert_eq!(f.index_at(s, 20.0, [x(b), 0.0]), b, "byte {b}");
+        }
+        // Selecting "c א" covers two stretches: "c " and, at the far right, "א".
+        let r = f.selection_rects(s, 20.0, 2, 6);
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert!(r[1][0] > r[0][0] + r[0][2], "{r:?}");
+    }
+
+    /// A right-to-left paragraph starts at the right: its trailing `!` draws
+    /// leftmost, and its lines align to the block's right edge.
+    #[test]
+    fn rtl_paragraph_starts_at_the_right() {
+        let f = Font::from_bytes(DEFAULT_FONT.to_vec(), 0).unwrap();
+        let s = "שלום!";
+        let w = f.measure(s, 20.0).0;
+        let x = |b| f.caret_pos(s, 20.0, b)[0];
+        assert!(
+            (x(0) - w).abs() < 0.01,
+            "first letter at the right: {}",
+            x(0)
+        );
+        assert!(x(s.len() - 1) < x(2), "! left of the letters");
+        assert!(x(s.len()) < 0.01, "end caret at the left");
+        let two = "שלום\nabcdefghij";
+        let w = f.measure(two, 20.0).0;
+        assert!((f.caret_pos(two, 20.0, 0)[0] - w).abs() < 0.01);
+        assert!(
+            f.caret_pos(two, 20.0, 9)[0] < 0.01,
+            "the Latin line stays left"
+        );
+    }
 
     #[test]
     fn default_font_parses_and_lays_out() {
