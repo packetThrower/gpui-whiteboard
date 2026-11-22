@@ -23,6 +23,22 @@ pub(crate) fn u32_to_hsla(c: u32) -> Hsla {
     rgba(c).into()
 }
 
+/// Dark or light text for an opaque `fill` when `text` lacks contrast on it;
+/// `None` when `text` already reads or the fill is see-through (the canvas
+/// shows, and the theme ink is made for that).
+pub(crate) fn readable_on(fill: u32, text: Hsla) -> Option<u32> {
+    let lum = |c: Rgba| 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+    let f = Rgba::from(u32_to_hsla(fill));
+    if f.a < 0.6 {
+        return None;
+    }
+    let (lf, lt) = (lum(f), lum(Rgba::from(text)));
+    if (lf - lt).abs() >= 0.4 {
+        return None;
+    }
+    Some(if lf > 0.5 { 0x1F1F23FF } else { 0xF5F5F5FF })
+}
+
 /// A gpui `Hsla` packed into `0xRRGGBBAA` (used to store theme swatches).
 pub(crate) fn hsla_to_u32(c: Hsla) -> u32 {
     let r = Rgba::from(c);
@@ -231,7 +247,12 @@ pub(crate) fn build_thumbnail_layers(
         let stroke = e.stroke.map_or(ink, u32_to_hsla);
         let fill = e.fill.map(u32_to_hsla);
         let label = e.label.as_deref();
-        let label_color = e.label_color;
+        // A label with no color of its own takes the stroke color, unless that
+        // wouldn't read on the shape's fill (a template's pastel box in a dark
+        // theme, where the stroke falls back to light ink).
+        let label_color = e
+            .label_color
+            .or_else(|| e.fill.and_then(|f| readable_on(f, stroke)));
         let styles = e.styles.as_slice();
         match &e.kind {
             ElementKind::Embed(em) => {
@@ -1589,5 +1610,26 @@ mod tests {
                 assert!((u - v).abs() < px(0.5), "zoom {zoom}: {a:?} vs {b:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod label_contrast_tests {
+    use super::*;
+
+    #[test]
+    fn labels_stay_readable_on_their_fill() {
+        let white = u32_to_hsla(0xF5F5F5FF);
+        let dark = u32_to_hsla(0x1F1F23FF);
+        // White ink on a pastel yellow (a SWOT box in a dark theme): dark text.
+        assert_eq!(readable_on(0xFEF3A0FF, white), Some(0x1F1F23FF));
+        // Dark ink on the same box already reads.
+        assert_eq!(readable_on(0xFEF3A0FF, dark), None);
+        // Dark ink on a navy box: light text.
+        assert_eq!(readable_on(0x1E3A8AFF, dark), Some(0xF5F5F5FF));
+        // A see-through fill leaves the theme ink alone.
+        assert_eq!(readable_on(0xFEF3A022, white), None);
+        // A colored stroke that contrasts is kept.
+        assert_eq!(readable_on(0xFEF3A0FF, u32_to_hsla(0xB91C1CFF)), None);
     }
 }

@@ -4068,6 +4068,22 @@ impl WhiteboardView {
         if self.picker.is_some() && self.picker_bounds.get().contains(&ev.position) {
             return;
         }
+        // The menu acts on the selection, so a right-click on a shape that isn't
+        // in it selects that shape first (topmost, as a left-click picks).
+        let p = self.event_to_world(ev.position);
+        let pad = SELECT_PAD / self.scene.camera.zoom.max(MIN_ZOOM);
+        let hit = self
+            .scene
+            .elements
+            .iter()
+            .rev()
+            .find(|e| hit_test(&e.kind, p[0], p[1], pad))
+            .map(|e| e.id);
+        if let Some(id) = hit
+            && !self.selected.contains(&id)
+        {
+            self.selected = vec![id];
+        }
         // Show the menu when there's a selection (copy / cut / z-order / save) or
         // paste is wired (so you can paste onto empty canvas). Positioned at the click.
         if self.selected.is_empty() && self.on_paste.is_none() {
@@ -9108,5 +9124,20 @@ mod board_tests {
                 .is_some_and(|e| e.styles.iter().any(|s| s.style.italic))
         });
         assert!(!italic, "second ⌘I removes italic");
+    }
+
+    #[gpui::test]
+    fn right_click_selects_the_shape_under_it(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(200.0, 260.0));
+        cx.simulate_keystrokes("o");
+        drag(&mut cx, at(400.0, 200.0), at(500.0, 260.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(150.0, 230.0));
+        let ellipse = elements(&v, &cx)[1].id;
+        cx.simulate_mouse_down(at(450.0, 230.0), MouseButton::Right, Modifiers::default());
+        cx.simulate_mouse_up(at(450.0, 230.0), MouseButton::Right, Modifiers::default());
+        assert_eq!(v.read_with(&cx, |b, _| b.selected.clone()), vec![ellipse]);
     }
 }
