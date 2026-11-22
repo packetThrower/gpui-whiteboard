@@ -79,6 +79,10 @@ pub struct Element {
     /// this; lines stay regular anchored arrows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mindmap: Option<MindMapNodeMeta>,
+    /// Elements sharing a group id select, move and copy as one (⌘G / ⌘⇧G).
+    /// `None` = ungrouped. Absent in older boards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

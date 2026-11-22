@@ -1015,8 +1015,8 @@ pub(crate) fn paint_ellipse(
 /// Vertices of box-fitting polygons in box-relative coords: `(±1, ±1)` is the
 /// box edge, `(0, 0)` the center. Scaled to the half-extents, rotated about the
 /// center, and projected by [`paint_box_polygon`].
-const DIAMOND_UNIT: [(f32, f32); 4] = [(0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)];
-const TRIANGLE_UNIT: [(f32, f32); 3] = [(0.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+pub(crate) const DIAMOND_UNIT: [(f32, f32); 4] = [(0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)];
+pub(crate) const TRIANGLE_UNIT: [(f32, f32); 3] = [(0.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
 
 /// A 5-point star (outer radius 1, inner 0.382), point-up.
 pub(crate) fn star_unit() -> [(f32, f32); 10] {

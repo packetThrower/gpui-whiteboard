@@ -22,6 +22,7 @@
 //! glyph layouts are cached. A built-`Path` cache remains a further optimization
 //! for extremely dense visible scenes.
 
+mod export;
 mod font;
 mod geometry;
 mod input;
@@ -36,7 +37,8 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
-pub use font::Font;
+pub use export::{Affine, DrawItem, Drawing};
+pub use font::{Font, Seg};
 use geometry::*;
 use input::WhiteboardInputElement;
 use paint::*;
@@ -165,6 +167,8 @@ pub enum Tool {
     Arrow,
     DashedArrow,
     Text,
+    /// Click to place a sticky note and type on it.
+    Sticky,
     MindMap,
     Flowchart,
     Embed,
@@ -192,6 +196,7 @@ impl Tool {
             Tool::Arrow => "↗",
             Tool::DashedArrow => "⇢",
             Tool::Text => "T",
+            Tool::Sticky => "▤",
             Tool::MindMap => "◎",
             Tool::Flowchart => "⇅",
             Tool::Embed => "▤",
@@ -217,6 +222,7 @@ impl Tool {
             Tool::Arrow => "Arrow (A)",
             Tool::DashedArrow => "Dashed arrow (K)",
             Tool::Text => "Text (T)",
+            Tool::Sticky => "Sticky note (N)",
             Tool::MindMap => "Mind map (M)",
             Tool::Flowchart => "Flowchart (F)",
             Tool::Embed => "Page card",
@@ -241,6 +247,7 @@ impl Tool {
             "a" => Tool::Arrow,
             "k" => Tool::DashedArrow,
             "t" => Tool::Text,
+            "n" => Tool::Sticky,
             "m" => Tool::MindMap,
             "f" => Tool::Flowchart,
             "i" => Tool::Image,
@@ -268,6 +275,7 @@ impl Tool {
         const LINE: &[u8] = include_bytes!("../assets/icons/line.svg");
         const ARROW: &[u8] = include_bytes!("../assets/icons/arrow.svg");
         const TEXT: &[u8] = include_bytes!("../assets/icons/text.svg");
+        const STICKY: &[u8] = include_bytes!("../assets/icons/sticky.svg");
         const MINDMAP: &[u8] = include_bytes!("../assets/icons/mindmap.svg");
         const FLOWCHART: &[u8] = include_bytes!("../assets/icons/flowchart.svg");
         const EMBED: &[u8] = include_bytes!("../assets/icons/embed.svg");
@@ -287,6 +295,7 @@ impl Tool {
             Tool::Arrow => Some(("wb-icon-arrow", ARROW)),
             Tool::DashedArrow => None,
             Tool::Text => Some(("wb-icon-text", TEXT)),
+            Tool::Sticky => Some(("wb-icon-sticky", STICKY)),
             Tool::MindMap => Some(("wb-icon-mindmap", MINDMAP)),
             Tool::Flowchart => Some(("wb-icon-flowchart", FLOWCHART)),
             Tool::Embed => Some(("wb-icon-embed", EMBED)),
@@ -1228,6 +1237,7 @@ impl WhiteboardView {
             label: None,
             label_color: None,
             styles: Vec::new(),
+            group: None,
             mindmap: None,
         });
         self.selected = vec![id];
@@ -1272,6 +1282,7 @@ impl WhiteboardView {
             label: None,
             label_color: None,
             styles: Vec::new(),
+            group: None,
             mindmap: None,
         });
         self.selected = vec![id];
@@ -1323,6 +1334,7 @@ impl WhiteboardView {
                 label_color: Some(0x0f172aff),
                 styles: Vec::new(),
                 mindmap,
+                group: None,
             });
             id
         };
@@ -1450,6 +1462,7 @@ impl WhiteboardView {
                 label: None,
                 label_color: None,
                 styles: Vec::new(),
+                group: None,
                 mindmap: None,
             });
         };
@@ -1521,6 +1534,7 @@ impl WhiteboardView {
                 label: Some(label.to_string()),
                 label_color: Some(0x0f172aff),
                 styles: Vec::new(),
+                group: None,
                 mindmap: None,
             });
             id
@@ -1562,6 +1576,7 @@ impl WhiteboardView {
                 label: None,
                 label_color: None,
                 styles: Vec::new(),
+                group: None,
                 mindmap: None,
             });
         };
@@ -2146,6 +2161,7 @@ impl WhiteboardView {
             label: Some(label.to_string()),
             label_color: Some(0x0f172aff),
             styles: Vec::new(),
+            group: None,
             mindmap: Some(MindMapNodeMeta {
                 parent: Some(parent),
                 side,
@@ -2189,6 +2205,7 @@ impl WhiteboardView {
             label: None,
             label_color: None,
             styles: Vec::new(),
+            group: None,
             mindmap: None,
         });
         if let Some(root_id) = self.mindmap_root_of(parent) {
@@ -2751,6 +2768,98 @@ impl WhiteboardView {
         serde_json::to_string(&elems).ok()
     }
 
+    /// The selection, origin-normalized (as [`Self::selection_json`] writes it).
+    fn selection_normalized(&self) -> Vec<Element> {
+        self.selection_json()
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default()
+    }
+
+    /// Copy the selection in place, nudged by `nudge` screen px (0 for an
+    /// Alt-drag, which then moves the copy); the copy becomes the selection.
+    fn duplicate_selection(&mut self, nudge: f32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((x0, y0, x1, y1)) = self.selection_bbox() else {
+            return;
+        };
+        let elems = self.selection_normalized();
+        let d = nudge / self.scene.camera.zoom.max(MIN_ZOOM);
+        let center = [(x0 + x1) / 2.0 + d, (y0 + y1) / 2.0 + d];
+        self.stamp_elements_at(&elems, Some(center), window, cx);
+    }
+
+    /// ⌘G: tie the selection into one group (selects, moves, copies as one).
+    /// ⌘⇧G: undo that for every group the selection touches.
+    fn set_grouped(&mut self, grouped: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected.len() < 2 && grouped {
+            return;
+        }
+        self.push_undo();
+        let gid = grouped.then(|| {
+            self.next_id += 1;
+            self.next_id - 1
+        });
+        for e in self.scene.elements.iter_mut() {
+            if self.selected.contains(&e.id) {
+                e.group = gid;
+            }
+        }
+        self.dirty = true;
+        self.flush(window, cx);
+        cx.notify();
+    }
+
+    /// Place a sticky note centered on world point `p` and start typing on it:
+    /// a pale yellow square whose label wraps and shrinks to fit.
+    fn add_sticky(&mut self, p: [f32; 2], window: &mut Window, cx: &mut Context<Self>) {
+        const SIZE: f32 = 160.0;
+        self.push_undo();
+        let side = SIZE / self.scene.camera.zoom.max(MIN_ZOOM);
+        let id = self.next_id;
+        self.next_id += 1;
+        self.scene.elements.push(Element {
+            id,
+            kind: ElementKind::Rect(BoxGeom {
+                x: p[0] - side / 2.0,
+                y: p[1] - side / 2.0,
+                w: side,
+                h: side,
+                width: NIB / self.scene.camera.zoom.max(MIN_ZOOM),
+                rotation: 0.0,
+            }),
+            stroke: Some(0xE2CC5AFF),
+            fill: Some(0xFEF3A0FF),
+            label: None,
+            label_color: None,
+            styles: Vec::new(),
+            mindmap: None,
+            group: None,
+        });
+        self.selected = vec![id];
+        self.begin_text_edit(id, 0, window, cx);
+        self.dirty = true;
+        cx.notify();
+    }
+
+    /// `id` and everything grouped with it.
+    fn with_group(&self, id: u64) -> Vec<u64> {
+        let group = self
+            .scene
+            .elements
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.group);
+        match group {
+            Some(g) => self
+                .scene
+                .elements
+                .iter()
+                .filter(|e| e.group == Some(g))
+                .map(|e| e.id)
+                .collect(),
+            None => vec![id],
+        }
+    }
+
     /// Hand the current selection to the host to be saved as a named template.
     fn save_selection_as_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.context_menu = None;
@@ -2804,12 +2913,41 @@ impl WhiteboardView {
             cam.y + (f32::from(b.size.height) / 2.0) / z,
         ]);
         let off = [center[0] - tw / 2.0, center[1] - th / 2.0];
+        // Fresh ids, then re-point what linked inside the copied set (arrow
+        // anchors, mind-map parents, groups); links to anything outside it are
+        // dropped, so a copy never stays wired to the original.
+        let ids: std::collections::HashMap<u64, u64> = elems
+            .iter()
+            .map(|e| {
+                self.next_id += 1;
+                (e.id, self.next_id - 1)
+            })
+            .collect();
+        let mut groups: std::collections::HashMap<u64, u64> = Default::default();
         let mut new_ids = Vec::with_capacity(elems.len());
         for e in elems {
             let mut c = e.clone();
             translate(&mut c.kind, off[0], off[1]);
-            c.id = self.next_id;
-            self.next_id += 1;
+            c.id = ids[&e.id];
+            if let ElementKind::Line(sg) | ElementKind::Arrow(sg) = &mut c.kind {
+                for a in [&mut sg.start_anchor, &mut sg.end_anchor] {
+                    *a = a.and_then(|a| {
+                        ids.get(&a.element_id).map(|&id| SegmentAnchor {
+                            element_id: id,
+                            ..a
+                        })
+                    });
+                }
+            }
+            if let Some(m) = c.mindmap.as_mut() {
+                m.parent = m.parent.and_then(|p| ids.get(&p).copied());
+            }
+            c.group = c.group.map(|g| {
+                *groups.entry(g).or_insert_with(|| {
+                    self.next_id += 1;
+                    self.next_id - 1
+                })
+            });
             new_ids.push(c.id);
             self.scene.elements.push(c);
         }
@@ -3716,6 +3854,11 @@ impl WhiteboardView {
             return;
         }
 
+        if self.tool == Tool::Sticky {
+            self.add_sticky(p, window, cx);
+            return;
+        }
+
         if self.tool == Tool::Text {
             // A single click on existing text only selects it. Editing existing
             // content is deliberately double-click-only; clicking empty canvas
@@ -3743,6 +3886,7 @@ impl WhiteboardView {
                     label: None,
                     label_color: None,
                     styles: Vec::new(),
+                    group: None,
                     mindmap: None,
                 });
                 self.selected = vec![id];
@@ -3859,20 +4003,26 @@ impl WhiteboardView {
                 .map(|e| e.id);
             match hit {
                 Some(id) if ev.modifiers.shift => {
-                    // Shift-click toggles membership (no move).
-                    if let Some(pos) = self.selected.iter().position(|&s| s == id) {
-                        self.selected.remove(pos);
+                    // Shift-click toggles membership (no move) — a whole group
+                    // at a time.
+                    let members = self.with_group(id);
+                    if self.is_selected(id) {
+                        self.selected.retain(|s| !members.contains(s));
                     } else {
-                        self.selected.push(id);
+                        self.selected.extend(members);
                     }
                     self.drag_from = None;
                 }
                 Some(id) => {
-                    // Click an unselected element selects only it; clicking one
-                    // already in the selection keeps the group (so a drag moves
-                    // them all). Either way, arm a move.
+                    // Click an unselected element selects only it (and its
+                    // group); clicking one already in the selection keeps the
+                    // selection (so a drag moves them all). Either way, arm a move.
                     if !self.is_selected(id) {
-                        self.selected = vec![id];
+                        self.selected = self.with_group(id);
+                    }
+                    // Alt-drag copies: duplicate in place and move the copy.
+                    if ev.modifiers.alt {
+                        self.duplicate_selection(0.0, window, cx);
                     }
                     self.drag_from = Some(p);
                     // Capture the primary element's top-left so the move can drive
@@ -3965,6 +4115,7 @@ impl WhiteboardView {
             Tool::Pan
             | Tool::Select
             | Tool::Text
+            | Tool::Sticky
             | Tool::MindMap
             | Tool::Flowchart
             | Tool::Embed
@@ -4021,11 +4172,21 @@ impl WhiteboardView {
         if let Some((a, b)) = self.marquee.take() {
             let (x0, x1) = (a[0].min(b[0]), a[0].max(b[0]));
             let (y0, y1) = (a[1].min(b[1]), a[1].max(b[1]));
-            for e in &self.scene.elements {
-                let bb = bbox(&e.kind);
-                let hits = bb.0 <= x1 && bb.2 >= x0 && bb.1 <= y1 && bb.3 >= y0;
-                if hits && !self.selected.contains(&e.id) {
-                    self.selected.push(e.id);
+            let hit: Vec<u64> = self
+                .scene
+                .elements
+                .iter()
+                .filter(|e| {
+                    let bb = bbox(&e.kind);
+                    bb.0 <= x1 && bb.2 >= x0 && bb.1 <= y1 && bb.3 >= y0
+                })
+                .map(|e| e.id)
+                .collect();
+            // A touched group comes along whole.
+            let whole: Vec<u64> = hit.into_iter().flat_map(|id| self.with_group(id)).collect();
+            for id in whole {
+                if !self.selected.contains(&id) {
+                    self.selected.push(id);
                 }
             }
             cx.notify();
@@ -4051,6 +4212,7 @@ impl WhiteboardView {
                     label: None,
                     label_color: self.active_text,
                     styles: Vec::new(),
+                    group: None,
                     mindmap: None,
                 });
                 if completed_connection {
@@ -4091,7 +4253,7 @@ impl WhiteboardView {
             .find(|e| hit_test(&e.kind, p[0], p[1], pad))
             .map(|e| e.id);
         match hit {
-            Some(id) if !self.selected.contains(&id) => self.selected = vec![id],
+            Some(id) if !self.selected.contains(&id) => self.selected = self.with_group(id),
             Some(_) => {}
             // Empty canvas: the menu is about the canvas (paste), not whatever
             // happened to be selected.
@@ -5189,6 +5351,20 @@ impl WhiteboardView {
             // the host can paste a clipboard image instead.
             return self.try_paste(window, cx);
         }
+        if cmd && ks.key == "d" {
+            if self.selected.is_empty() {
+                return false;
+            }
+            self.duplicate_selection(20.0, window, cx);
+            return true;
+        }
+        if cmd && ks.key == "g" {
+            if self.selected.is_empty() {
+                return false;
+            }
+            self.set_grouped(!ks.modifiers.shift, window, cx);
+            return true;
+        }
         if cmd || ks.modifiers.alt {
             return false;
         }
@@ -6161,6 +6337,12 @@ impl Render for WhiteboardView {
                         .on_click(cx.listener(|this, _ev, _w, cx| this.set_tool(Tool::Text, cx)))
                         .into_any_element(),
                 );
+                cats.push(
+                    tool_btn(Tool::Sticky)
+                        .tooltip(self.tip(Tool::Sticky.label()))
+                        .on_click(cx.listener(|this, _ev, _w, cx| this.set_tool(Tool::Sticky, cx)))
+                        .into_any_element(),
+                );
             }
         }
 
@@ -6886,7 +7068,34 @@ impl Render for WhiteboardView {
                                         this.delete_selected(window, cx);
                                     }
                                 },
-                            )));
+                            )))
+                            .child(row("wb-ctx-duplicate", "Duplicate", "⌘D").on_click(
+                                cx.listener(|this, _ev, window, cx| {
+                                    this.context_menu = None;
+                                    this.duplicate_selection(20.0, window, cx);
+                                }),
+                            ));
+                    // Group with two or more selected; Ungroup when any is grouped.
+                    let grouped = self
+                        .scene
+                        .elements
+                        .iter()
+                        .any(|e| self.selected.contains(&e.id) && e.group.is_some());
+                    if grouped {
+                        panel = panel.child(row("wb-ctx-ungroup", "Ungroup", "⌘⇧G").on_click(
+                            cx.listener(|this, _ev, window, cx| {
+                                this.context_menu = None;
+                                this.set_grouped(false, window, cx);
+                            }),
+                        ));
+                    } else if self.selected.len() > 1 {
+                        panel = panel.child(row("wb-ctx-group", "Group", "⌘G").on_click(
+                            cx.listener(|this, _ev, window, cx| {
+                                this.context_menu = None;
+                                this.set_grouped(true, window, cx);
+                            }),
+                        ));
+                    }
                 }
                 // Paste shows whenever the host wired it (so it works on empty canvas).
                 if self.on_paste.is_some() {
@@ -7754,6 +7963,7 @@ mod tests {
                 label: None,
                 label_color: None,
                 styles: Vec::new(),
+                group: None,
                 mindmap: None,
             }],
             ..Scene::default()
@@ -7792,6 +8002,7 @@ mod tests {
                     label: None,
                     label_color: None,
                     styles: Vec::new(),
+                    group: None,
                     mindmap: None,
                 },
                 Element {
@@ -7809,6 +8020,7 @@ mod tests {
                     label: Some("hi".into()),
                     label_color: Some(0x112233ff),
                     styles: Vec::new(),
+                    group: None,
                     mindmap: None,
                 },
                 Element {
@@ -7828,6 +8040,7 @@ mod tests {
                     label: None,
                     label_color: None,
                     styles: Vec::new(),
+                    group: None,
                     mindmap: None,
                 },
             ],
@@ -8020,6 +8233,7 @@ mod tests {
                     ..Default::default()
                 },
             }],
+            group: None,
             mindmap: None,
         };
         let back: Element = serde_json::from_str(&serde_json::to_string(&el).unwrap()).unwrap();
@@ -8411,6 +8625,7 @@ mod tests {
             label: None,
             label_color: None,
             styles: Vec::new(),
+            group: None,
             mindmap: None,
         };
         let json = serde_json::to_string(&elem).unwrap();
@@ -8461,6 +8676,7 @@ mod tests {
                 label: None,
                 label_color: None,
                 styles: Vec::new(),
+                group: None,
                 mindmap: None,
             };
             let json = serde_json::to_string(&elem).unwrap();
@@ -9238,5 +9454,148 @@ mod board_tests {
             Some(els[1].id),
             "{seg:?}"
         );
+    }
+
+    #[gpui::test]
+    fn duplicate_and_alt_drag_copy(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(200.0, 260.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(150.0, 230.0));
+        cx.simulate_keystrokes("ctrl-d");
+        let els = elements(&v, &cx);
+        assert_eq!(els.len(), 2, "⌘D copies");
+        let (a, b) = (bbox(&els[0]).unwrap(), bbox(&els[1]).unwrap());
+        assert!(
+            near(b[0] - a[0], 20.0) && near(b[1] - a[1], 20.0),
+            "nudged: {a:?} {b:?}"
+        );
+        assert_eq!(v.read_with(&cx, |b, _| b.selected.clone()), vec![els[1].id]);
+        // Alt-drag the original: a third copy lands where it's dropped, the
+        // original stays.
+        click(&mut cx, at(110.0, 205.0));
+        cx.simulate_mouse_down(at(110.0, 205.0), MouseButton::Left, Modifiers::alt());
+        cx.simulate_mouse_move(at(410.0, 405.0), MouseButton::Left, Modifiers::alt());
+        cx.simulate_mouse_up(at(410.0, 405.0), MouseButton::Left, Modifiers::alt());
+        let els = elements(&v, &cx);
+        assert_eq!(els.len(), 3);
+        assert!(near(bbox(&els[0]).unwrap()[0], 100.0), "original stayed");
+        assert!(
+            (bbox(&els[2]).unwrap()[0] - 400.0).abs() < 12.0, // move snapping
+            "copy moved: {:?}",
+            bbox(&els[2])
+        );
+    }
+
+    #[gpui::test]
+    fn grouped_shapes_select_and_move_together(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(160.0, 240.0));
+        cx.simulate_keystrokes("o");
+        drag(&mut cx, at(300.0, 200.0), at(360.0, 240.0));
+        cx.simulate_keystrokes("v");
+        drag(&mut cx, at(50.0, 150.0), at(400.0, 300.0));
+        cx.simulate_keystrokes("ctrl-g escape");
+        // One click on the ellipse now selects both.
+        click(&mut cx, at(330.0, 220.0));
+        assert_eq!(
+            v.read_with(&cx, |b, _| b.selected.len()),
+            2,
+            "the group comes along"
+        );
+        drag(&mut cx, at(330.0, 220.0), at(330.0, 320.0));
+        let els = elements(&v, &cx);
+        assert!(near(bbox(&els[0]).unwrap()[1], 300.0), "rect moved with it");
+        // Ungroup: a click selects just one again.
+        cx.simulate_keystrokes("ctrl-shift-g escape");
+        click(&mut cx, at(330.0, 320.0));
+        assert_eq!(v.read_with(&cx, |b, _| b.selected.len()), 1);
+        // The group survives a save.
+        cx.simulate_keystrokes("ctrl-z");
+        let json = v.read_with(&cx, |b, _| b.scene.to_json());
+        assert!(json.contains("\"group\""), "group id is stored");
+    }
+
+    #[gpui::test]
+    fn a_copied_arrow_follows_its_copied_shapes(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(200.0, 300.0), at(300.0, 360.0));
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(500.0, 300.0), at(600.0, 360.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(250.0, 330.0));
+        let button = v.read_with(&cx, |b, _| {
+            let a = &b.scene.elements[0];
+            crate::paint::connector_button_centers(&a.kind, b.scene.camera, b.bounds.get().origin)
+                .into_iter()
+                .max_by(|p, q| p.x.partial_cmp(&q.x).unwrap())
+                .unwrap()
+        });
+        cx.simulate_mouse_move(button, None, Modifiers::default());
+        drag(&mut cx, button, at(550.0, 330.0));
+        // Select all three and duplicate.
+        drag(&mut cx, at(150.0, 250.0), at(650.0, 420.0));
+        cx.simulate_keystrokes("ctrl-d");
+        let els = elements(&v, &cx);
+        assert_eq!(els.len(), 6);
+        let copies: Vec<u64> = els[3..].iter().map(|e| e.id).collect();
+        let seg = els[3..]
+            .iter()
+            .find_map(|e| match &e.kind {
+                ElementKind::Arrow(s) => Some(*s),
+                _ => None,
+            })
+            .unwrap();
+        for a in [seg.start_anchor, seg.end_anchor] {
+            let id = a.expect("still attached").element_id;
+            assert!(
+                copies.contains(&id),
+                "the copy points at copies, not originals"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn sticky_note_places_and_takes_typing(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("n");
+        click(&mut cx, at(400.0, 400.0));
+        cx.simulate_input("call the plumber");
+        cx.simulate_keystrokes("escape");
+        let els = elements(&v, &cx);
+        assert_eq!(els.len(), 1);
+        let b = bbox(&els[0]).unwrap();
+        assert!(
+            near(b[0] + b[2] / 2.0, 400.0) && near(b[2], b[3]),
+            "a square on the click: {b:?}"
+        );
+        assert_eq!(els[0].label.as_deref(), Some("call the plumber"));
+        assert!(els[0].fill.is_some(), "a filled note");
+    }
+
+    #[gpui::test]
+    fn svg_export_has_every_kind(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        for (key, y) in [("r", 200.0), ("o", 300.0), ("a", 400.0), ("p", 500.0)] {
+            cx.simulate_keystrokes(key);
+            drag(&mut cx, at(100.0, y), at(220.0, y + 40.0));
+        }
+        cx.simulate_keystrokes("t");
+        click(&mut cx, at(400.0, 500.0));
+        cx.simulate_input("hi");
+        cx.simulate_keystrokes("escape");
+        let d = v
+            .read_with(&cx, |b, _| b.scene().to_drawing(&b.font, gpui::black()))
+            .expect("a drawing");
+        // Bounds cover the content plus padding.
+        assert!(d.bounds[0] < 100.0 && d.bounds[1] < 200.0 && d.bounds[2] > 300.0);
+        let svg = d.to_svg(Some(0xFFFFFFFF), |_| None);
+        assert!(svg.starts_with("<svg") && svg.trim_end().ends_with("</svg>"));
+        // rect, ellipse, arrow line + head, pen stroke, text glyphs.
+        assert!(svg.matches("<path").count() >= 6, "{svg}");
+        assert!(svg.contains("stroke-linecap"), "strokes are styled");
     }
 }
