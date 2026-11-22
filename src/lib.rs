@@ -5668,6 +5668,23 @@ impl WhiteboardView {
             }
             return;
         }
+        // Enter on one selected text box or shape edits it, caret at the end,
+        // like a double-click.
+        let ks = &ev.keystroke;
+        if self.editing.is_none()
+            && ks.key == "enter"
+            && !(ks.modifiers.platform || ks.modifiers.control || ks.modifiers.alt)
+            && let [id] = self.selected[..]
+            && let Some(tg) = self.edit_target(id)
+        {
+            self.editing = Some(id);
+            self.caret = tg.content.len();
+            self.sel_anchor = self.caret;
+            self.marked_range = None;
+            cx.stop_propagation(); // or the input path types the Enter too
+            cx.notify();
+            return;
+        }
         // Not editing text → keys are board shortcuts (tools, delete, undo/redo).
         if self.editing.is_none() {
             if !self.handle_shortcut(ev, window, cx) {
@@ -10175,5 +10192,19 @@ mod board_tests {
             (id, b.checkbox_at([wx, wy]))
         });
         assert_eq!(hit, Some((id, raw.find("☐ two").unwrap())));
+    }
+
+    #[gpui::test]
+    fn enter_edits_the_selected_shapes_label(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(300.0, 320.0));
+        cx.simulate_keystrokes("escape");
+        let id = elements(&v, &cx)[0].id;
+        v.update(&mut cx, |b, _| b.selected = vec![id]);
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("hi");
+        cx.simulate_keystrokes("escape");
+        assert_eq!(elements(&v, &cx)[0].label.as_deref(), Some("hi"));
     }
 }
