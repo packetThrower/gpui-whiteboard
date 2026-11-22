@@ -56,6 +56,63 @@ fn fallback_face(i: usize) -> Option<ttf_parser::Face<'static>> {
     ttf_parser::Face::parse(bytes.as_deref()?, index).ok()
 }
 
+/// The face fontconfig picks for `ch`, for systems whose fonts aren't at the
+/// paths in [`FALLBACK_FACES`] (NixOS keeps them in the store, Fedora and Arch
+/// use their own folders). Faces found stay loaded and are tried first for
+/// later chars, so a script costs one `fc-list` run, not one per char.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn fontconfig_face(ch: char) -> Option<(&'static ttf_parser::Face<'static>, ttf_parser::GlyphId)> {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    // ponytail: leaks each found face for the process's life; one per script.
+    static FOUND: Mutex<Vec<(String, &'static ttf_parser::Face<'static>)>> = Mutex::new(Vec::new());
+    static MISSES: OnceLock<Mutex<HashSet<char>>> = OnceLock::new();
+    let mut found = FOUND.lock().ok()?;
+    if let Some((f, g)) = found
+        .iter()
+        .find_map(|(_, f)| Some((*f, f.glyph_index(ch)?)))
+    {
+        return Some((f, g));
+    }
+    let mut misses = MISSES.get_or_init(Default::default).lock().ok()?;
+    if misses.contains(&ch) {
+        return None;
+    }
+    let hit = (|| {
+        // fc-list, not fc-match: fc-match returns its best overall match even
+        // when that face lacks `ch`, so a face already loaded for one script
+        // came back for the next and the char counted as missing.
+        let out = std::process::Command::new("fc-list")
+            .args([
+                &format!(":charset={:x}", ch as u32),
+                "-f",
+                "%{file}\t%{index}\n",
+            ])
+            .output()
+            .ok()?;
+        let out = String::from_utf8(out.stdout).ok()?;
+        let mut faces: Vec<(&str, &str)> = out
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .filter(|(p, _)| !found.iter().any(|(f, _)| f == p))
+            .collect();
+        // fc-list's order is arbitrary: prefer an upright regular face.
+        faces.sort_by_key(|(p, _)| !p.contains("Regular"));
+        let (path, index) = faces.first()?;
+        let bytes: &'static [u8] = Box::leak(std::fs::read(path).ok()?.into_boxed_slice());
+        let face: &'static _ = Box::leak(Box::new(
+            ttf_parser::Face::parse(bytes, index.trim().parse::<u32>().unwrap_or(0) & 0xFFFF)
+                .ok()?,
+        ));
+        found.push((path.to_string(), face));
+        Some((face, face.glyph_index(ch)?))
+    })();
+    if hit.is_none() {
+        misses.insert(ch);
+    }
+    hit
+}
+
 /// A font's face plus the system fallbacks (parsed on first use), so a layout
 /// draws each char from the first face that has it. Metrics (ascent, line
 /// height) stay the primary face's.
@@ -82,6 +139,10 @@ impl<'a> Faces<'a> {
                 {
                     return (f, g, scale(f));
                 }
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            if let Some((f, g)) = fontconfig_face(ch) {
+                return (f, g, scale(f));
             }
         }
         (&self.primary, ttf_parser::GlyphId(0), scale(&self.primary))

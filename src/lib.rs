@@ -4920,7 +4920,14 @@ impl WhiteboardView {
             if !text.is_some_and(has_box) {
                 return None; // skip the layout work for the many without one
             }
-            let tg = self.edit_target(e.id)?;
+            // Hit-test the text as painted: a label not being edited is drawn
+            // trimmed, so its lines sit elsewhere than the raw label's.
+            let editing = self.editing == Some(e.id);
+            let tg = self.text_target(e.id, editing)?;
+            let lead = match (&e.kind, editing) {
+                (ElementKind::Text(_), _) | (_, true) => 0,
+                _ => text.map_or(0, |t| t.len() - t.trim_start().len()),
+            };
             let (lx, ly) = rotate_pt(p[0], p[1], tg.pivot[0], tg.pivot[1], -tg.rotation);
             let (lx, ly) = (lx - tg.x, ly - tg.y);
             let lh = self.font.measure("", tg.size).1;
@@ -4935,7 +4942,7 @@ impl WhiteboardView {
                         .caret_pos_wrapped(&tg.content, tg.size, tg.wrap, at + 3);
                     let slop = tg.size * 0.15;
                     (lx >= a[0] - slop && lx <= b[0] + slop && ly >= a[1] && ly <= a[1] + lh)
-                        .then_some((e.id, at))
+                        .then_some((e.id, at + lead))
                 })
         })
     }
@@ -4963,6 +4970,12 @@ impl WhiteboardView {
     }
 
     fn edit_target(&self, id: u64) -> Option<EditTarget> {
+        self.text_target(id, true)
+    }
+
+    /// [`Self::edit_target`] for the label as `editing` paints it: raw while
+    /// edited, trimmed otherwise (see [`label_text`]).
+    fn text_target(&self, id: u64, editing: bool) -> Option<EditTarget> {
         let e = self.scene.elements.iter().find(|e| e.id == id)?;
         match &e.kind {
             ElementKind::Text(t) => Some(EditTarget {
@@ -4976,7 +4989,7 @@ impl WhiteboardView {
             }),
             kind if is_closed_shape(kind) => {
                 let (bx, by, bw, bh, rot) = box_like(kind)?;
-                let label = e.label.clone().unwrap_or_default();
+                let label = label_text(e.label.as_deref(), editing).to_string();
                 let blk = shape_label_block(&self.font, kind, bx, by, bw, bh, &label);
                 Some(EditTarget {
                     content: label,
@@ -5653,6 +5666,23 @@ impl WhiteboardView {
             {
                 self.toggle_toolbar_orientation(window, cx);
             }
+            return;
+        }
+        // Enter on one selected text box or shape edits it, caret at the end,
+        // like a double-click.
+        let ks = &ev.keystroke;
+        if self.editing.is_none()
+            && ks.key == "enter"
+            && !(ks.modifiers.platform || ks.modifiers.control || ks.modifiers.alt)
+            && let [id] = self.selected[..]
+            && let Some(tg) = self.edit_target(id)
+        {
+            self.editing = Some(id);
+            self.caret = tg.content.len();
+            self.sel_anchor = self.caret;
+            self.marked_range = None;
+            cx.stop_propagation(); // or the input path types the Enter too
+            cx.notify();
             return;
         }
         // Not editing text → keys are board shortcuts (tools, delete, undo/redo).
@@ -10137,5 +10167,44 @@ mod board_tests {
         // rect, ellipse, arrow line + head, pen stroke, text glyphs.
         assert!(svg.matches("<path").count() >= 6, "{svg}");
         assert!(svg.contains("stroke-linecap"), "strokes are styled");
+    }
+
+    #[gpui::test]
+    fn checkbox_hits_where_an_unedited_label_paints_it(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(300.0, 320.0));
+        // Leading and trailing blank lines: painted trimmed, so the boxes sit
+        // a few lines away from where the raw label would put them.
+        let raw = "\n\n☐ one\n☐ two\n\n\n";
+        let (id, hit) = v.update(&mut cx, |b, _| {
+            let id = b.scene.elements[0].id;
+            b.scene.elements[0].label = Some(raw.into());
+            b.editing = None;
+            let tg = b.text_target(id, false).expect("a label");
+            let second = tg.content.find("☐ two").unwrap();
+            let c = b
+                .font
+                .caret_pos_wrapped(&tg.content, tg.size, tg.wrap, second);
+            let lh = b.font.measure("", tg.size).1;
+            let (wx, wy) = (tg.x + c[0] + tg.size * 0.3, tg.y + c[1] + lh / 2.0);
+            let (wx, wy) = rotate_pt(wx, wy, tg.pivot[0], tg.pivot[1], tg.rotation);
+            (id, b.checkbox_at([wx, wy]))
+        });
+        assert_eq!(hit, Some((id, raw.find("☐ two").unwrap())));
+    }
+
+    #[gpui::test]
+    fn enter_edits_the_selected_shapes_label(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(300.0, 320.0));
+        cx.simulate_keystrokes("escape");
+        let id = elements(&v, &cx)[0].id;
+        v.update(&mut cx, |b, _| b.selected = vec![id]);
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("hi");
+        cx.simulate_keystrokes("escape");
+        assert_eq!(elements(&v, &cx)[0].label.as_deref(), Some("hi"));
     }
 }
