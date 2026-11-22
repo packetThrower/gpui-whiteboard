@@ -65,7 +65,9 @@ There are two layers:
   flyout, and every selected line or arrow has a handle at its middle: drag it
   to bend the line, or back onto the line to straighten it; hold Shift to
   also slide the curve's peak along the line. Bound arrows keep
-  their curve as their shapes move.
+  their curve as their shapes move. With any line tool, pressing on a shape
+  draws from its nearest connector point, bound there (a plain click still
+  selects the shape).
 - **Bullets and checklists.** In any text — text boxes, shape labels, sticky
   notes — `* ` or `- ` at the start of a line becomes `• `, and `[ ] ` becomes a
   `☐` box (`[x] ` a ticked `☑`). Enter continues the list, Enter on an empty
@@ -499,7 +501,8 @@ The view handles these when it has focus (it focuses on a canvas click):
 | right-click | context menu (z-order, copy/cut/paste, duplicate, group/ungroup, save as template); while editing text, a **Text ▸** fly-out toggles bold / italic / underline / strike / highlight (✓ marks active) |
 
 While editing a text element it behaves like a normal text field: click to place the
-caret, click-drag or double-click to select, arrows / Home / End (⇧ extends), ⌘A, and
+caret, click-drag or double-click to select, arrows / Home / End (⇧ extends),
+⌘Home / ⌘End (⌘↑ / ⌘↓) for the whole text's start / end, ⌘A, and
 ⌘C / ⌘X / ⌘V on the system clipboard; Esc (or a click away) commits.
 
 ## Persistence

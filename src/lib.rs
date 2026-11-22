@@ -126,7 +126,7 @@ const TEXT_SIZE: f32 = 18.0;
 /// border, so the auto-shrunk label never touches the edge.
 const LABEL_PAD: f32 = 8.0;
 /// How much a curved-line tool bows a new line (see `SegGeom::bend`).
-const CURVED_TOOL_BEND: f32 = 0.2;
+const CURVED_TOOL_BEND: f32 = 0.12;
 
 /// Default highlighter color (packed `0xRRGGBBAA`) for the highlight toggle —
 /// translucent yellow so the text stays readable.
@@ -3548,6 +3548,68 @@ impl WhiteboardView {
     /// The topmost connector point under the cursor. Connectors are exposed on
     /// box-like visual elements (closed shapes, text, image) at the midpoints of
     /// their rotated top/right/bottom/left edges.
+    /// A new line from `from` in the active line tool's look (straight or
+    /// curved, solid or dashed, with or without a head), optionally bound to a
+    /// shape at its start. `None` when the active tool doesn't draw lines.
+    fn segment_kind(
+        &self,
+        from: [f32; 2],
+        width: f32,
+        start_anchor: Option<SegmentAnchor>,
+    ) -> Option<ElementKind> {
+        let (arrow, dashed, bend) = match self.tool {
+            Tool::Line => (false, false, 0.0),
+            Tool::Arrow => (true, false, 0.0),
+            Tool::DashedArrow => (true, true, 0.0),
+            Tool::CurvedLine => (false, false, CURVED_TOOL_BEND),
+            Tool::CurvedArrow => (true, false, CURVED_TOOL_BEND),
+            Tool::CurvedDashedArrow => (true, true, CURVED_TOOL_BEND),
+            _ => return None,
+        };
+        let seg = SegGeom {
+            x1: from[0],
+            y1: from[1],
+            x2: from[0],
+            y2: from[1],
+            width,
+            style: if dashed {
+                SegmentStyle::Dashed
+            } else {
+                SegmentStyle::Solid
+            },
+            start_anchor,
+            end_anchor: None,
+            bend,
+            bend_at: 0.5,
+        };
+        Some(if arrow {
+            ElementKind::Arrow(seg)
+        } else {
+            ElementKind::Line(seg)
+        })
+    }
+
+    /// The topmost shape under world point `p` that takes connectors, and its
+    /// connector point nearest `p`.
+    fn shape_connector_near(&self, p: [f32; 2], pad: f32) -> Option<ConnectPoint> {
+        let e = self
+            .scene
+            .elements
+            .iter()
+            .rev()
+            .find(|e| connector_capable(&e.kind) && hit_test(&e.kind, p[0], p[1], pad))?;
+        let d = |q: &[f32; 2]| (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2);
+        connector_points(&e.kind)
+            .into_iter()
+            .enumerate()
+            .min_by(|a, b| d(&a.1).total_cmp(&d(&b.1)))
+            .map(|(index, pos)| ConnectPoint {
+                id: e.id,
+                index,
+                pos,
+            })
+    }
+
     fn connector_at(&self, pos: Point<Pixels>) -> Option<ConnectPoint> {
         let origin = self.bounds.get().origin;
         let near_px = CONNECTOR_BUTTON_SIZE * 0.65;
@@ -3868,6 +3930,29 @@ impl WhiteboardView {
             return;
         }
 
+        // A line tool pressed on a shape draws from it: the line starts at the
+        // shape's nearest connector point, bound there. A click without a drag
+        // still selects the shape (see the release handler).
+        if let Some(cp) = self.shape_connector_near(p, SELECT_PAD / zoom)
+            && let Some(kind) = self.segment_kind(
+                cp.pos,
+                self.active_width / zoom,
+                Some(SegmentAnchor {
+                    element_id: cp.id,
+                    connector: cp.index,
+                }),
+            )
+        {
+            self.pending = Some(Pending {
+                anchor: cp.pos,
+                kind,
+            });
+            self.connecting = Some(ConnectDrag { from: cp });
+            self.hovered_connector = Some(cp);
+            cx.notify();
+            return;
+        }
+
         // A single click on any existing element always means selection, even if
         // a drawing/text tool is currently active. This prevents accidentally
         // drawing over a shape when the user only meant to select it. A second
@@ -4138,78 +4223,15 @@ impl WhiteboardView {
             Tool::RoundRect => ElementKind::RoundRect(box0),
             Tool::Star => ElementKind::Star(box0),
             Tool::Hexagon => ElementKind::Hexagon(box0),
-            Tool::Line => ElementKind::Line(SegGeom {
-                x1: anchor[0],
-                y1: anchor[1],
-                x2: anchor[0],
-                y2: anchor[1],
-                width,
-                style: SegmentStyle::Solid,
-                start_anchor: None,
-                end_anchor: None,
-                bend: 0.0,
-                bend_at: 0.5,
-            }),
-            Tool::Arrow => ElementKind::Arrow(SegGeom {
-                x1: anchor[0],
-                y1: anchor[1],
-                x2: anchor[0],
-                y2: anchor[1],
-                width,
-                style: SegmentStyle::Solid,
-                start_anchor: None,
-                end_anchor: None,
-                bend: 0.0,
-                bend_at: 0.5,
-            }),
-            Tool::DashedArrow => ElementKind::Arrow(SegGeom {
-                x1: anchor[0],
-                y1: anchor[1],
-                x2: anchor[0],
-                y2: anchor[1],
-                width,
-                style: SegmentStyle::Dashed,
-                start_anchor: None,
-                end_anchor: None,
-                bend: 0.0,
-                bend_at: 0.5,
-            }),
-            Tool::CurvedLine => ElementKind::Line(SegGeom {
-                x1: anchor[0],
-                y1: anchor[1],
-                x2: anchor[0],
-                y2: anchor[1],
-                width,
-                style: SegmentStyle::Solid,
-                start_anchor: None,
-                end_anchor: None,
-                bend: CURVED_TOOL_BEND,
-                bend_at: 0.5,
-            }),
-            Tool::CurvedArrow => ElementKind::Arrow(SegGeom {
-                x1: anchor[0],
-                y1: anchor[1],
-                x2: anchor[0],
-                y2: anchor[1],
-                width,
-                style: SegmentStyle::Solid,
-                start_anchor: None,
-                end_anchor: None,
-                bend: CURVED_TOOL_BEND,
-                bend_at: 0.5,
-            }),
-            Tool::CurvedDashedArrow => ElementKind::Arrow(SegGeom {
-                x1: anchor[0],
-                y1: anchor[1],
-                x2: anchor[0],
-                y2: anchor[1],
-                width,
-                style: SegmentStyle::Dashed,
-                start_anchor: None,
-                end_anchor: None,
-                bend: CURVED_TOOL_BEND,
-                bend_at: 0.5,
-            }),
+            Tool::Line
+            | Tool::Arrow
+            | Tool::DashedArrow
+            | Tool::CurvedLine
+            | Tool::CurvedArrow
+            | Tool::CurvedDashedArrow => match self.segment_kind(anchor, width, None) {
+                Some(kind) => kind,
+                None => return,
+            },
             // These tools don't create a drag-element here (handled earlier).
             Tool::Pan
             | Tool::Select
@@ -4292,7 +4314,17 @@ impl WhiteboardView {
             return;
         }
         if let Some(pending) = self.pending.take() {
-            let completed_connection = self.connecting.take().is_some();
+            let connection = self.connecting.take();
+            let completed_connection = connection.is_some();
+            // A line tool's press on a shape that never became a line: that
+            // was a click, which selects the shape.
+            if let Some(conn) = connection
+                && !committable(&pending.kind)
+                && self.tool != Tool::Select
+            {
+                self.tool = Tool::Select;
+                self.selected = self.with_group(conn.from.id);
+            }
             if committable(&pending.kind) {
                 self.push_undo();
                 let id = self.next_id;
@@ -5319,6 +5351,10 @@ impl WhiteboardView {
                         self.replace_selection(id, &text, cx);
                     }
                 }
+                // Ctrl+Home / Ctrl+End (⌘↑ / ⌘↓ on a Mac): the whole text's
+                // start / end.
+                "home" | "up" => self.move_caret(0, shift, cx),
+                "end" | "down" => self.move_caret(content.len(), shift, cx),
                 _ => cx.propagate(), // ⌘Z / ⌘W / … belong to the host
             }
             return;
@@ -9982,7 +10018,7 @@ mod board_tests {
         let s = seg(&mut cx, 0);
         assert_eq!(s.bend, CURVED_TOOL_BEND);
         let (_, _, _, max_y) = crate::geometry::bbox(&elements(&v, &cx)[0].kind);
-        assert!(max_y > 430.0, "bounds include the curve: {max_y}");
+        assert!(max_y > 415.0, "bounds include the curve: {max_y}");
         // A straight line bends by dragging its middle handle…
         cx.simulate_keystrokes("l");
         drag(&mut cx, at(100.0, 200.0), at(300.0, 200.0));
@@ -10020,6 +10056,8 @@ mod board_tests {
             (apex[0] - 150.0).abs() < 4.0 && (apex[1] - 150.0).abs() < 1.0,
             "the apex is under the pointer: {apex:?}"
         );
+        // The peak can't slide so far that the curve hooks past an end.
+        assert_eq!(s.bend_at_toward([295.0, 150.0]), 0.75);
         // …and snaps back straight near the line.
         let mid = s.bend_point();
         drag(&mut cx, at(mid[0], mid[1]), at(150.0, 202.0));
@@ -10032,6 +10070,50 @@ mod board_tests {
                 .to_svg(None, |_| None)
         });
         assert!(svg.contains('Q'), "a quadratic curve in the SVG");
+    }
+
+    #[gpui::test]
+    fn line_tools_draw_from_a_shape_and_a_click_still_selects(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(200.0, 260.0));
+        let rect = elements(&v, &cx)[0].id;
+        // Pressing inside the rect with a line tool draws from its nearest
+        // connector, bound there.
+        v.update(&mut cx, |b, cx| b.set_tool(Tool::CurvedArrow, cx));
+        drag(&mut cx, at(190.0, 230.0), at(400.0, 300.0));
+        let els = elements(&v, &cx);
+        assert_eq!(els.len(), 2);
+        let ElementKind::Arrow(s) = els[1].kind else {
+            panic!("an arrow")
+        };
+        assert_eq!(s.start_anchor.map(|a| a.element_id), Some(rect));
+        assert!(s.bend != 0.0, "in the curved tool's look");
+        // A click on the rect (no drag) still just selects it.
+        cx.simulate_keystrokes("a");
+        click(&mut cx, at(150.0, 230.0));
+        assert_eq!(elements(&v, &cx).len(), 2);
+        assert_eq!(v.read_with(&cx, |b, _| b.selected.clone()), vec![rect]);
+        assert_eq!(v.read_with(&cx, |b, _| b.tool()), Tool::Select);
+    }
+
+    #[gpui::test]
+    fn ctrl_home_and_end_jump_to_the_text_ends(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("t");
+        click(&mut cx, at(300.0, 300.0));
+        cx.simulate_input("one");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("two");
+        cx.simulate_keystrokes("ctrl-home");
+        cx.simulate_input("<");
+        cx.simulate_keystrokes("ctrl-end");
+        cx.simulate_input(">");
+        cx.simulate_keystrokes("escape");
+        let ElementKind::Text(t) = &elements(&v, &cx)[0].kind else {
+            panic!("a text element")
+        };
+        assert_eq!(t.content, "<one\ntwo>");
     }
 
     #[gpui::test]

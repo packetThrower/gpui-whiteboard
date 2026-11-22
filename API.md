@@ -357,12 +357,12 @@ they existed keep loading.
 | `style` | [`SegmentStyle`](#segmentstyle) | Solid (default) or dashed stroke. |
 | `start_anchor`, `end_anchor` | `Option<SegmentAnchor>` | When set, the endpoint is BOUND to a shape's connector point and follows it as the shape moves/resizes/rotates; moving the segment itself detaches. Endpoints snap to hovered connector points while drawing. |
 | `bend` | `f32` | How far the line bows: the curve's middle sits `bend × length` off the straight line's middle (the sign picks the side). Relative to the length, so a bound curve keeps its shape as its shapes move. `0` = straight; omitted from JSON when 0. Drawn as a quadratic Bézier. |
-| `bend_at` | `f32` | Where along the line the curve peaks, as a fraction from `(x1, y1)`: `0.5` = symmetric (omitted from JSON). Off-center skews the curve toward that end; the handle stays its apex (farthest point from the line). Clamped to 0.05–0.95. |
+| `bend_at` | `f32` | Where along the line the curve peaks, as a fraction from `(x1, y1)`: `0.5` = symmetric (omitted from JSON). Off-center skews the curve toward that end; the handle stays its apex (farthest point from the line). Clamped to 0.25–0.75, where the curve never overshoots an end. |
 
 **Methods** — `control` is the curve's Bézier control point (`None` when
 straight); `bend_point` is the curve's peak, where the bend handle sits;
 `bend_toward(p)` is the `bend` that puts the peak nearest `p` (keeping
-`bend_at`); `bend_at_toward(p)` slides the peak along the line toward `p`; `points(n)`
+`bend_at`); `bend_at_toward(p)` slides the peak along the line toward `p` (0.25–0.75); `points(n)`
 samples `n + 1` points along the line, ends included (just the two ends when
 straight).
 

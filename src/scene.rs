@@ -482,7 +482,7 @@ pub struct SegGeom {
     pub bend: f32,
     /// Where along the line the curve peaks, as a fraction of the way from
     /// (x1, y1) to (x2, y2): 0.5 (the default) is symmetric; off-center skews
-    /// the curve toward that end. Kept within 0.05–0.95. Absent in older
+    /// the curve toward that end. Kept within 0.25–0.75, where the curve never overshoots an end. Absent in older
     /// boards.
     #[serde(default = "half", skip_serializing_if = "is_half")]
     pub bend_at: f32,
@@ -516,9 +516,10 @@ impl SegGeom {
         })
     }
 
-    /// `bend_at`, kept off the very ends.
+    /// `bend_at`, kept within 0.25–0.75: past that the control point lands
+    /// beyond an end and the curve hooks back.
     fn bend_at(&self) -> f32 {
-        self.bend_at.clamp(0.05, 0.95)
+        self.bend_at.clamp(0.25, 0.75)
     }
 
     /// The curve's apex — `bend_at` of the way along the line, `bend × length`
@@ -546,14 +547,14 @@ impl SegGeom {
     }
 
     /// The `bend_at` that slides the curve's peak along the line toward world
-    /// point `p` (clamped to 0.05–0.95).
+    /// point `p` (clamped to 0.25–0.75).
     pub fn bend_at_toward(&self, p: [f32; 2]) -> f32 {
         let (dx, dy) = (self.x2 - self.x1, self.y2 - self.y1);
         let len2 = dx * dx + dy * dy;
         if len2 < 1e-6 {
             return 0.5;
         }
-        (((p[0] - self.x1) * dx + (p[1] - self.y1) * dy) / len2).clamp(0.05, 0.95)
+        (((p[0] - self.x1) * dx + (p[1] - self.y1) * dy) / len2).clamp(0.25, 0.75)
     }
 
     /// `n + 1` points along the line, ends included.
