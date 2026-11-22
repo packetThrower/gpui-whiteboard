@@ -55,6 +55,26 @@ There are two layers:
   groups move across boards and windows.
 - **Undo / redo**, multi-select (marquee + shift-click), group move/resize, and a
   rotate grip on the selection.
+- **Duplicate and group.** `⌘D` or ⌥-drag copies the selection (arrows between
+  copied shapes stay attached to the copies); `⌘G` / `⌘⇧G` group and ungroup, so
+  a group selects, moves and copies as one.
+- **Sticky notes.** `N` drops a paper note with a folded corner and a soft shadow
+  (yellow, pink, blue, green or orange, picked from a swatch row) and starts
+  typing from the top-left; long text wraps and shrinks to fit.
+- **Curved lines.** Curved line / arrow / dashed-arrow tools in the Lines
+  flyout, and every selected line or arrow has a handle at its middle: drag it
+  to bend the line, or back onto the line to straighten it; hold Shift to
+  also slide the curve's peak along the line. Bound arrows keep
+  their curve as their shapes move. With any line tool, pressing on a shape
+  draws from its nearest connector point, bound there (a plain click still
+  selects the shape).
+- **Bullets and checklists.** In any text — text boxes, shape labels, sticky
+  notes — `* ` or `- ` at the start of a line becomes `• `, and `[ ] ` becomes a
+  `☐` box (`[x] ` a ticked `☑`). Enter continues the list, Enter on an empty
+  item ends it, and clicking a box ticks it. The marks are plain characters,
+  so they survive search, copy and export.
+- **Export.** `Scene::to_drawing` turns a board into vector paths the host can
+  save as SVG (`Drawing::to_svg`) or rasterize to PNG.
 - **Theme-reactive.** Colors come from a `Fn() -> WhiteboardStyle` closure read at
   paint time, so the board follows live theme / light-dark changes (and can differ
   per window) with no push from the host.
@@ -69,7 +89,7 @@ Published on [crates.io](https://crates.io/crates/gpui-whiteboard):
 
 ```toml
 [dependencies]
-gpui-whiteboard = "0.5"
+gpui-whiteboard = "0.6"
 ```
 
 > **gpui version:** the crate depends on GPUI as published on crates.io — the
@@ -388,7 +408,7 @@ pub enum ElementKind {       // serialized snake_case: {"rect": {...}}, {"image"
     Draw(Stroke),                                        // freehand pen
     Rect(BoxGeom), Ellipse(BoxGeom), Diamond(BoxGeom),   // box-like shapes
     Triangle(BoxGeom), RoundRect(BoxGeom),
-    Star(BoxGeom), Hexagon(BoxGeom),
+    Star(BoxGeom), Hexagon(BoxGeom), Sticky(BoxGeom),
     Line(SegGeom), Arrow(SegGeom),
     Text(TextGeom),
     Embed(EmbedGeom),                                    // page-card
@@ -457,26 +477,32 @@ The view handles these when it has focus (it focuses on a canvas click):
 
 | Input | Action |
 | --- | --- |
-| `H` `V` `P` `R` `O` `D` `G` `U` `S` `X` `L` `A` `T` `I` | pick a tool (pan, select, pen, rect, ellipse, diamond, triangle, rounded-rect, star, hexagon, line, arrow, text, image) |
+| `H` `V` `P` `R` `O` `D` `G` `U` `S` `X` `L` `A` `T` `N` `I` | pick a tool (pan, select, pen, rect, ellipse, diamond, triangle, rounded-rect, star, hexagon, line, arrow, text, sticky note, image) |
 | `⌫` / `Delete` | delete the selection |
 | `⌘Z` / `⌘⇧Z` | undo / redo |
 | `⌘C` / `⌘X` / `⌘V` | copy / cut / paste the selection |
+| `⌘D` · ⌥-drag | duplicate the selection |
+| `* ` / `- ` / `[ ] ` at a line's start (editing text) | bullet / checkbox; Enter continues the list, Enter on an empty item ends it |
+| click a `☐` / `☑` | tick / untick it |
+| `⌘G` / `⌘⇧G` | group / ungroup the selection |
 | `⌘]` / `⌘[` | bring forward / send backward (add `⇧` for to-front / to-back) |
 | `Esc` | deselect (or close the color picker / templates modal) |
 | drag (Pan tool) · middle-drag | pan the canvas |
 | scroll · pinch | zoom |
 | hold `⌥` while dragging | snap to the grid |
-| click / shift-click / marquee-drag (Select tool) | select one / add / box-select |
+| click / shift-click / marquee-drag (Select tool) | select one / add / box-select (a grouped element brings its whole group) |
+| drag a line's middle handle | bend it (drag back onto the line to straighten); with `⇧`, also slide the peak along the line |
 | drag a handle · the round grip above a selection | resize (corners scale; edge handles stretch one axis, on a single element or a group) · rotate |
 | double-click a page-card | open its page (via `OpenPageFn`) |
 | double-click text · `T`-click text | edit it — click a letter for the caret, drag / double-click to select |
 | double-click a closed shape | edit its centered label — wraps + auto-shrinks to fit; full caret / selection / clipboard |
 | `⌘B` `⌘I` `⌘U` `⇧⌘X` `⇧⌘H` (editing text) | bold / italic / underline / strikethrough / highlight the selection (toggle) |
 | drag the dotted grip (left of the toolbar) | move the toolbar (tap `R` mid-drag to flip row ↔ column; double-click the grip resets it) |
-| right-click | context menu (z-order, copy/cut/paste, save as template); while editing text, a **Text ▸** fly-out toggles bold / italic / underline / strike / highlight (✓ marks active) |
+| right-click | context menu (z-order, copy/cut/paste, duplicate, group/ungroup, save as template); while editing text, a **Text ▸** fly-out toggles bold / italic / underline / strike / highlight (✓ marks active) |
 
 While editing a text element it behaves like a normal text field: click to place the
-caret, click-drag or double-click to select, arrows / Home / End (⇧ extends), ⌘A, and
+caret, click-drag or double-click to select, arrows / Home / End (⇧ extends),
+⌘Home / ⌘End (⌘↑ / ⌘↓) for the whole text's start / end, ⌘A, and
 ⌘C / ⌘X / ⌘V on the system clipboard; Esc (or a click away) commits.
 
 ## Persistence

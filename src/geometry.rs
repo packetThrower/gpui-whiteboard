@@ -15,7 +15,8 @@ pub(crate) fn committable(kind: &ElementKind) -> bool {
         | ElementKind::Triangle(b)
         | ElementKind::RoundRect(b)
         | ElementKind::Star(b)
-        | ElementKind::Hexagon(b) => b.w > 1.0 || b.h > 1.0,
+        | ElementKind::Hexagon(b)
+        | ElementKind::Sticky(b) => b.w > 1.0 || b.h > 1.0,
         ElementKind::Line(s) | ElementKind::Arrow(s) => {
             let (dx, dy) = (s.x2 - s.x1, s.y2 - s.y1);
             dx * dx + dy * dy > 4.0
@@ -38,6 +39,7 @@ pub(crate) fn is_closed_shape(kind: &ElementKind) -> bool {
             | ElementKind::RoundRect(_)
             | ElementKind::Star(_)
             | ElementKind::Hexagon(_)
+            | ElementKind::Sticky(_)
     )
 }
 
@@ -52,7 +54,8 @@ pub(crate) fn set_kind_width(kind: &mut ElementKind, w: f32) {
         | ElementKind::Triangle(b)
         | ElementKind::RoundRect(b)
         | ElementKind::Star(b)
-        | ElementKind::Hexagon(b) => b.width = w,
+        | ElementKind::Hexagon(b)
+        | ElementKind::Sticky(b) => b.width = w,
         ElementKind::Line(s) | ElementKind::Arrow(s) => s.width = w,
         ElementKind::Text(_) | ElementKind::Embed(_) | ElementKind::Image(_) => {}
     }
@@ -79,7 +82,8 @@ pub(crate) fn box_like(kind: &ElementKind) -> Option<(f32, f32, f32, f32, f32)> 
         | ElementKind::Triangle(b)
         | ElementKind::RoundRect(b)
         | ElementKind::Star(b)
-        | ElementKind::Hexagon(b) => Some((b.x, b.y, b.w, b.h, b.rotation)),
+        | ElementKind::Hexagon(b)
+        | ElementKind::Sticky(b) => Some((b.x, b.y, b.w, b.h, b.rotation)),
         ElementKind::Text(t) => {
             let (w, h) = text_extent(t);
             Some((t.x, t.y, w, h, t.rotation))
@@ -160,7 +164,8 @@ pub(crate) fn reference_angle(kind: &ElementKind) -> Option<f32> {
         | ElementKind::Triangle(b)
         | ElementKind::RoundRect(b)
         | ElementKind::Star(b)
-        | ElementKind::Hexagon(b) => Some(b.rotation),
+        | ElementKind::Hexagon(b)
+        | ElementKind::Sticky(b) => Some(b.rotation),
         ElementKind::Text(t) => Some(t.rotation),
         ElementKind::Image(im) => Some(snap_quarter(im.rotation)),
         ElementKind::Line(s) | ElementKind::Arrow(s) => Some((s.y2 - s.y1).atan2(s.x2 - s.x1)),
@@ -188,7 +193,8 @@ pub(crate) fn rotate_element(kind: &mut ElementKind, cx: f32, cy: f32, delta: f3
         | ElementKind::Triangle(b)
         | ElementKind::RoundRect(b)
         | ElementKind::Star(b)
-        | ElementKind::Hexagon(b) => {
+        | ElementKind::Hexagon(b)
+        | ElementKind::Sticky(b) => {
             (b.x, b.y) = orbit(b.x, b.y, b.w, b.h);
             b.rotation += delta;
         }
@@ -272,12 +278,7 @@ pub(crate) fn bbox(kind: &ElementKind) -> (f32, f32, f32, f32) {
     }
     match kind {
         ElementKind::Draw(s) => aabb(&s.points),
-        ElementKind::Line(s) | ElementKind::Arrow(s) => (
-            s.x1.min(s.x2),
-            s.y1.min(s.y2),
-            s.x1.max(s.x2),
-            s.y1.max(s.y2),
-        ),
+        ElementKind::Line(s) | ElementKind::Arrow(s) => aabb(&s.points(16)),
         ElementKind::Embed(em) => (em.x, em.y, em.x + em.w, em.y + em.h),
         // Handled above (all box-like kinds go through `box_like`).
         ElementKind::Rect(_)
@@ -287,6 +288,7 @@ pub(crate) fn bbox(kind: &ElementKind) -> (f32, f32, f32, f32) {
         | ElementKind::RoundRect(_)
         | ElementKind::Star(_)
         | ElementKind::Hexagon(_)
+        | ElementKind::Sticky(_)
         | ElementKind::Text(_)
         | ElementKind::Image(_) => unreachable!(),
     }
@@ -379,7 +381,8 @@ pub(crate) fn translate(kind: &mut ElementKind, dx: f32, dy: f32) {
         | ElementKind::Triangle(b)
         | ElementKind::RoundRect(b)
         | ElementKind::Star(b)
-        | ElementKind::Hexagon(b) => {
+        | ElementKind::Hexagon(b)
+        | ElementKind::Sticky(b) => {
             b.x += dx;
             b.y += dy;
         }
@@ -535,7 +538,8 @@ pub(crate) fn resize_about(kind: &mut ElementKind, ax: f32, ay: f32, sx: f32, sy
         | ElementKind::Triangle(b)
         | ElementKind::RoundRect(b)
         | ElementKind::Star(b)
-        | ElementKind::Hexagon(b) => {
+        | ElementKind::Hexagon(b)
+        | ElementKind::Sticky(b) => {
             let (x0, x1) = (fx(b.x), fx(b.x + b.w));
             let (y0, y1) = (fy(b.y), fy(b.y + b.h));
             b.x = x0.min(x1);

@@ -22,6 +22,7 @@
 //! glyph layouts are cached. A built-`Path` cache remains a further optimization
 //! for extremely dense visible scenes.
 
+mod export;
 mod font;
 mod geometry;
 mod input;
@@ -36,7 +37,8 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
-pub use font::Font;
+pub use export::{Affine, DrawItem, Drawing};
+pub use font::{Font, Seg};
 use geometry::*;
 use input::WhiteboardInputElement;
 use paint::*;
@@ -123,6 +125,8 @@ const TEXT_SIZE: f32 = 18.0;
 /// Inset (world units) kept between a shape's inscribed text rectangle and its
 /// border, so the auto-shrunk label never touches the edge.
 const LABEL_PAD: f32 = 8.0;
+/// How much a curved-line tool bows a new line (see `SegGeom::bend`).
+const CURVED_TOOL_BEND: f32 = 0.12;
 
 /// Default highlighter color (packed `0xRRGGBBAA`) for the highlight toggle —
 /// translucent yellow so the text stays readable.
@@ -164,7 +168,12 @@ pub enum Tool {
     Line,
     Arrow,
     DashedArrow,
+    CurvedLine,
+    CurvedArrow,
+    CurvedDashedArrow,
     Text,
+    /// Click to place a sticky note and type on it.
+    Sticky,
     MindMap,
     Flowchart,
     Embed,
@@ -191,7 +200,11 @@ impl Tool {
             Tool::Line => "╱",
             Tool::Arrow => "↗",
             Tool::DashedArrow => "⇢",
+            Tool::CurvedLine => "⌒",
+            Tool::CurvedArrow => "↷",
+            Tool::CurvedDashedArrow => "⤳",
             Tool::Text => "T",
+            Tool::Sticky => "▤",
             Tool::MindMap => "◎",
             Tool::Flowchart => "⇅",
             Tool::Embed => "▤",
@@ -216,7 +229,11 @@ impl Tool {
             Tool::Line => "Line (L)",
             Tool::Arrow => "Arrow (A)",
             Tool::DashedArrow => "Dashed arrow (K)",
+            Tool::CurvedLine => "Curved line",
+            Tool::CurvedArrow => "Curved arrow",
+            Tool::CurvedDashedArrow => "Curved dashed arrow",
             Tool::Text => "Text (T)",
+            Tool::Sticky => "Sticky note (N)",
             Tool::MindMap => "Mind map (M)",
             Tool::Flowchart => "Flowchart (F)",
             Tool::Embed => "Page card",
@@ -241,6 +258,7 @@ impl Tool {
             "a" => Tool::Arrow,
             "k" => Tool::DashedArrow,
             "t" => Tool::Text,
+            "n" => Tool::Sticky,
             "m" => Tool::MindMap,
             "f" => Tool::Flowchart,
             "i" => Tool::Image,
@@ -268,6 +286,10 @@ impl Tool {
         const LINE: &[u8] = include_bytes!("../assets/icons/line.svg");
         const ARROW: &[u8] = include_bytes!("../assets/icons/arrow.svg");
         const TEXT: &[u8] = include_bytes!("../assets/icons/text.svg");
+        const CURVE: &[u8] = include_bytes!("../assets/icons/curve.svg");
+        const CURVE_ARROW: &[u8] = include_bytes!("../assets/icons/curve-arrow.svg");
+        const CURVE_DASHED: &[u8] = include_bytes!("../assets/icons/curve-arrow-dashed.svg");
+        const STICKY: &[u8] = include_bytes!("../assets/icons/sticky.svg");
         const MINDMAP: &[u8] = include_bytes!("../assets/icons/mindmap.svg");
         const FLOWCHART: &[u8] = include_bytes!("../assets/icons/flowchart.svg");
         const EMBED: &[u8] = include_bytes!("../assets/icons/embed.svg");
@@ -286,7 +308,11 @@ impl Tool {
             Tool::Line => Some(("wb-icon-line", LINE)),
             Tool::Arrow => Some(("wb-icon-arrow", ARROW)),
             Tool::DashedArrow => None,
+            Tool::CurvedLine => Some(("wb-icon-curve", CURVE)),
+            Tool::CurvedArrow => Some(("wb-icon-curve-arrow", CURVE_ARROW)),
+            Tool::CurvedDashedArrow => Some(("wb-icon-curve-arrow-dashed", CURVE_DASHED)),
             Tool::Text => Some(("wb-icon-text", TEXT)),
+            Tool::Sticky => Some(("wb-icon-sticky", STICKY)),
             Tool::MindMap => Some(("wb-icon-mindmap", MINDMAP)),
             Tool::Flowchart => Some(("wb-icon-flowchart", FLOWCHART)),
             Tool::Embed => Some(("wb-icon-embed", EMBED)),
@@ -323,7 +349,15 @@ impl ToolGroup {
                 Tool::Hexagon,
                 Tool::Star,
             ],
-            ToolGroup::Lines => &[Tool::Pen, Tool::Line, Tool::Arrow, Tool::DashedArrow],
+            ToolGroup::Lines => &[
+                Tool::Pen,
+                Tool::Line,
+                Tool::Arrow,
+                Tool::DashedArrow,
+                Tool::CurvedLine,
+                Tool::CurvedArrow,
+                Tool::CurvedDashedArrow,
+            ],
             ToolGroup::PagesImages => &[Tool::MindMap, Tool::Flowchart, Tool::Embed, Tool::Image],
         }
     }
@@ -617,7 +651,7 @@ struct GroupResizing {
 #[derive(Clone, Copy)]
 struct EndpointDrag {
     id: u64,
-    /// Which endpoint: 0 = (x1,y1), 1 = (x2,y2).
+    /// Which endpoint: 0 = (x1,y1), 1 = (x2,y2); 2 = the bend handle.
     which: usize,
 }
 
@@ -784,6 +818,8 @@ pub struct WhiteboardView {
     picker: Option<Picker>,
     /// The tool category whose flyout is open, if any.
     open_group: Option<ToolGroup>,
+    /// The paper the Sticky tool places (one of `STICKY_COLORS`).
+    sticky_color: u32,
     /// Whether the thickness-preset flyout is open.
     width_open: bool,
     /// Whether the font flyout (upload / default) is open.
@@ -908,6 +944,7 @@ impl WhiteboardView {
             active_width: NIB,
             picker: None,
             open_group: None,
+            sticky_color: crate::paint::STICKY_COLORS[0],
             width_open: false,
             font_open: false,
             templates_open: false,
@@ -1081,8 +1118,10 @@ impl WhiteboardView {
         cx: &mut Context<Self>,
     ) {
         if double {
+            // Back to the default: top-center, as a row.
             self.toolbar_drag = None;
             self.toolbar_pos = None;
+            self.toolbar_vertical = false;
             if let Some(f) = self.on_move_toolbar.clone() {
                 f(None, self.toolbar_vertical, window, cx);
             }
@@ -1226,6 +1265,7 @@ impl WhiteboardView {
             label: None,
             label_color: None,
             styles: Vec::new(),
+            group: None,
             mindmap: None,
         });
         self.selected = vec![id];
@@ -1270,6 +1310,7 @@ impl WhiteboardView {
             label: None,
             label_color: None,
             styles: Vec::new(),
+            group: None,
             mindmap: None,
         });
         self.selected = vec![id];
@@ -1321,6 +1362,7 @@ impl WhiteboardView {
                 label_color: Some(0x0f172aff),
                 styles: Vec::new(),
                 mindmap,
+                group: None,
             });
             id
         };
@@ -1442,12 +1484,15 @@ impl WhiteboardView {
                     style: SegmentStyle::Solid,
                     start_anchor: Some(start_anchor),
                     end_anchor: Some(end_anchor),
+                    bend: 0.0,
+                    bend_at: 0.5,
                 }),
                 stroke,
                 fill: None,
                 label: None,
                 label_color: None,
                 styles: Vec::new(),
+                group: None,
                 mindmap: None,
             });
         };
@@ -1519,6 +1564,7 @@ impl WhiteboardView {
                 label: Some(label.to_string()),
                 label_color: Some(0x0f172aff),
                 styles: Vec::new(),
+                group: None,
                 mindmap: None,
             });
             id
@@ -1554,12 +1600,15 @@ impl WhiteboardView {
                     style: SegmentStyle::Solid,
                     start_anchor: Some(start_anchor),
                     end_anchor: Some(end_anchor),
+                    bend: 0.0,
+                    bend_at: 0.5,
                 }),
                 stroke,
                 fill: None,
                 label: None,
                 label_color: None,
                 styles: Vec::new(),
+                group: None,
                 mindmap: None,
             });
         };
@@ -2144,6 +2193,7 @@ impl WhiteboardView {
             label: Some(label.to_string()),
             label_color: Some(0x0f172aff),
             styles: Vec::new(),
+            group: None,
             mindmap: Some(MindMapNodeMeta {
                 parent: Some(parent),
                 side,
@@ -2181,12 +2231,15 @@ impl WhiteboardView {
                 style: SegmentStyle::Solid,
                 start_anchor: Some(start_anchor),
                 end_anchor: Some(end_anchor),
+                bend: 0.0,
+                bend_at: 0.5,
             }),
             stroke: Some(0x2563ebff),
             fill: None,
             label: None,
             label_color: None,
             styles: Vec::new(),
+            group: None,
             mindmap: None,
         });
         if let Some(root_id) = self.mindmap_root_of(parent) {
@@ -2749,6 +2802,98 @@ impl WhiteboardView {
         serde_json::to_string(&elems).ok()
     }
 
+    /// The selection, origin-normalized (as [`Self::selection_json`] writes it).
+    fn selection_normalized(&self) -> Vec<Element> {
+        self.selection_json()
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default()
+    }
+
+    /// Copy the selection in place, nudged by `nudge` screen px (0 for an
+    /// Alt-drag, which then moves the copy); the copy becomes the selection.
+    fn duplicate_selection(&mut self, nudge: f32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((x0, y0, x1, y1)) = self.selection_bbox() else {
+            return;
+        };
+        let elems = self.selection_normalized();
+        let d = nudge / self.scene.camera.zoom.max(MIN_ZOOM);
+        let center = [(x0 + x1) / 2.0 + d, (y0 + y1) / 2.0 + d];
+        self.stamp_elements_at(&elems, Some(center), window, cx);
+    }
+
+    /// ⌘G: tie the selection into one group (selects, moves, copies as one).
+    /// ⌘⇧G: undo that for every group the selection touches.
+    fn set_grouped(&mut self, grouped: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected.len() < 2 && grouped {
+            return;
+        }
+        self.push_undo();
+        let gid = grouped.then(|| {
+            self.next_id += 1;
+            self.next_id - 1
+        });
+        for e in self.scene.elements.iter_mut() {
+            if self.selected.contains(&e.id) {
+                e.group = gid;
+            }
+        }
+        self.dirty = true;
+        self.flush(window, cx);
+        cx.notify();
+    }
+
+    /// Place a sticky note centered on world point `p` and start typing on it:
+    /// a pale yellow square whose label wraps and shrinks to fit.
+    fn add_sticky(&mut self, p: [f32; 2], window: &mut Window, cx: &mut Context<Self>) {
+        const SIZE: f32 = 160.0;
+        self.push_undo();
+        let side = SIZE / self.scene.camera.zoom.max(MIN_ZOOM);
+        let id = self.next_id;
+        self.next_id += 1;
+        self.scene.elements.push(Element {
+            id,
+            kind: ElementKind::Sticky(BoxGeom {
+                x: p[0] - side / 2.0,
+                y: p[1] - side / 2.0,
+                w: side,
+                h: side,
+                width: NIB / self.scene.camera.zoom.max(MIN_ZOOM),
+                rotation: 0.0,
+            }),
+            stroke: None,
+            fill: Some(self.sticky_color),
+            label: None,
+            label_color: None,
+            styles: Vec::new(),
+            mindmap: None,
+            group: None,
+        });
+        self.selected = vec![id];
+        self.begin_text_edit(id, 0, window, cx);
+        self.dirty = true;
+        cx.notify();
+    }
+
+    /// `id` and everything grouped with it.
+    fn with_group(&self, id: u64) -> Vec<u64> {
+        let group = self
+            .scene
+            .elements
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.group);
+        match group {
+            Some(g) => self
+                .scene
+                .elements
+                .iter()
+                .filter(|e| e.group == Some(g))
+                .map(|e| e.id)
+                .collect(),
+            None => vec![id],
+        }
+    }
+
     /// Hand the current selection to the host to be saved as a named template.
     fn save_selection_as_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.context_menu = None;
@@ -2775,26 +2920,68 @@ impl WhiteboardView {
     /// become the new selection. Shared by template apply and clipboard paste.
     /// No-op for an empty group.
     fn stamp_elements(&mut self, elems: &[Element], window: &mut Window, cx: &mut Context<Self>) {
+        self.stamp_elements_at(elems, None, window, cx);
+    }
+
+    /// [`Self::stamp_elements`], centered on world point `at` when given (a
+    /// right-click Paste lands where you clicked), else in the viewport.
+    fn stamp_elements_at(
+        &mut self,
+        elems: &[Element],
+        at: Option<[f32; 2]>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if elems.is_empty() {
             return;
         }
         self.open_group = None;
         self.push_undo();
-        // Center the (origin-normalized) group in the viewport.
+        // Center the (origin-normalized) group on `at`, or in the viewport.
         let b = self.bounds.get();
         let cam = self.scene.camera;
         let z = cam.zoom.max(MIN_ZOOM);
         let (tw, th) = elements_extent(elems);
-        let off = [
-            cam.x + (f32::from(b.size.width) / 2.0) / z - tw / 2.0,
-            cam.y + (f32::from(b.size.height) / 2.0) / z - th / 2.0,
-        ];
+        let center = at.unwrap_or([
+            cam.x + (f32::from(b.size.width) / 2.0) / z,
+            cam.y + (f32::from(b.size.height) / 2.0) / z,
+        ]);
+        let off = [center[0] - tw / 2.0, center[1] - th / 2.0];
+        // Fresh ids, then re-point what linked inside the copied set (arrow
+        // anchors, mind-map parents, groups); links to anything outside it are
+        // dropped, so a copy never stays wired to the original.
+        let ids: std::collections::HashMap<u64, u64> = elems
+            .iter()
+            .map(|e| {
+                self.next_id += 1;
+                (e.id, self.next_id - 1)
+            })
+            .collect();
+        let mut groups: std::collections::HashMap<u64, u64> = Default::default();
         let mut new_ids = Vec::with_capacity(elems.len());
         for e in elems {
             let mut c = e.clone();
             translate(&mut c.kind, off[0], off[1]);
-            c.id = self.next_id;
-            self.next_id += 1;
+            c.id = ids[&e.id];
+            if let ElementKind::Line(sg) | ElementKind::Arrow(sg) = &mut c.kind {
+                for a in [&mut sg.start_anchor, &mut sg.end_anchor] {
+                    *a = a.and_then(|a| {
+                        ids.get(&a.element_id).map(|&id| SegmentAnchor {
+                            element_id: id,
+                            ..a
+                        })
+                    });
+                }
+            }
+            if let Some(m) = c.mindmap.as_mut() {
+                m.parent = m.parent.and_then(|p| ids.get(&p).copied());
+            }
+            c.group = c.group.map(|g| {
+                *groups.entry(g).or_insert_with(|| {
+                    self.next_id += 1;
+                    self.next_id - 1
+                })
+            });
             new_ids.push(c.id);
             self.scene.elements.push(c);
         }
@@ -3235,7 +3422,12 @@ impl WhiteboardView {
         }
 
         if let ElementKind::Line(s) | ElementKind::Arrow(s) = kind {
-            for (which, (wx, wy)) in [(s.x1, s.y1), (s.x2, s.y2)].into_iter().enumerate() {
+            // `which` 2 is the bend handle at the curve's middle.
+            let [bx, by] = s.bend_point();
+            for (which, (wx, wy)) in [(s.x1, s.y1), (s.x2, s.y2), (bx, by)]
+                .into_iter()
+                .enumerate()
+            {
                 if near(wx, wy, 0.0, 0.0) {
                     return Some(HandleGrab::Endpoint(EndpointDrag { id, which }));
                 }
@@ -3356,6 +3548,68 @@ impl WhiteboardView {
     /// The topmost connector point under the cursor. Connectors are exposed on
     /// box-like visual elements (closed shapes, text, image) at the midpoints of
     /// their rotated top/right/bottom/left edges.
+    /// A new line from `from` in the active line tool's look (straight or
+    /// curved, solid or dashed, with or without a head), optionally bound to a
+    /// shape at its start. `None` when the active tool doesn't draw lines.
+    fn segment_kind(
+        &self,
+        from: [f32; 2],
+        width: f32,
+        start_anchor: Option<SegmentAnchor>,
+    ) -> Option<ElementKind> {
+        let (arrow, dashed, bend) = match self.tool {
+            Tool::Line => (false, false, 0.0),
+            Tool::Arrow => (true, false, 0.0),
+            Tool::DashedArrow => (true, true, 0.0),
+            Tool::CurvedLine => (false, false, CURVED_TOOL_BEND),
+            Tool::CurvedArrow => (true, false, CURVED_TOOL_BEND),
+            Tool::CurvedDashedArrow => (true, true, CURVED_TOOL_BEND),
+            _ => return None,
+        };
+        let seg = SegGeom {
+            x1: from[0],
+            y1: from[1],
+            x2: from[0],
+            y2: from[1],
+            width,
+            style: if dashed {
+                SegmentStyle::Dashed
+            } else {
+                SegmentStyle::Solid
+            },
+            start_anchor,
+            end_anchor: None,
+            bend,
+            bend_at: 0.5,
+        };
+        Some(if arrow {
+            ElementKind::Arrow(seg)
+        } else {
+            ElementKind::Line(seg)
+        })
+    }
+
+    /// The topmost shape under world point `p` that takes connectors, and its
+    /// connector point nearest `p`.
+    fn shape_connector_near(&self, p: [f32; 2], pad: f32) -> Option<ConnectPoint> {
+        let e = self
+            .scene
+            .elements
+            .iter()
+            .rev()
+            .find(|e| connector_capable(&e.kind) && hit_test(&e.kind, p[0], p[1], pad))?;
+        let d = |q: &[f32; 2]| (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2);
+        connector_points(&e.kind)
+            .into_iter()
+            .enumerate()
+            .min_by(|a, b| d(&a.1).total_cmp(&d(&b.1)))
+            .map(|(index, pos)| ConnectPoint {
+                id: e.id,
+                index,
+                pos,
+            })
+    }
+
     fn connector_at(&self, pos: Point<Pixels>) -> Option<ConnectPoint> {
         let origin = self.bounds.get().origin;
         let near_px = CONNECTOR_BUTTON_SIZE * 0.65;
@@ -3445,8 +3699,9 @@ impl WhiteboardView {
         pos: Point<Pixels>,
         source_id: u64,
     ) -> Option<(ConnectPoint, bool)> {
+        // Within this of a shape its nearest connector lights up, and releasing
+        // there binds to it: what's highlighted is what you get.
         const SHOW_DISTANCE_PX: f32 = 64.0;
-        const SNAP_DISTANCE_PX: f32 = 20.0;
         let origin = self.bounds.get().origin;
         let (sx, sy) = (f32::from(pos.x), f32::from(pos.y));
         let world = self.event_to_world(pos);
@@ -3482,12 +3737,7 @@ impl WhiteboardView {
                 )
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(distance_sq, connector)| {
-                (
-                    connector,
-                    distance_sq <= SNAP_DISTANCE_PX * SNAP_DISTANCE_PX,
-                )
-            })
+            .map(|(_, connector)| (connector, true))
     }
 
     fn on_left_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -3617,6 +3867,19 @@ impl WhiteboardView {
         let p = self.event_to_world(ev.position);
         let zoom = self.scene.camera.zoom.max(MIN_ZOOM);
 
+        // A click on a checklist box ticks it, with any tool, editing or not.
+        if ev.click_count == 1
+            && !ev.modifiers.shift
+            && !ev.modifiers.alt
+            && let Some((id, at)) = self.checkbox_at(p)
+        {
+            if self.editing.is_some_and(|e| e != id) {
+                self.commit_text(window, cx);
+            }
+            self.toggle_checkbox(id, at, window, cx);
+            return;
+        }
+
         // A press inside the text being edited drives its caret / selection (no
         // commit). A press anywhere else commits the edit, then falls through.
         if let Some(id) = self.editing {
@@ -3667,6 +3930,29 @@ impl WhiteboardView {
             return;
         }
 
+        // A line tool pressed on a shape draws from it: the line starts at the
+        // shape's nearest connector point, bound there. A click without a drag
+        // still selects the shape (see the release handler).
+        if let Some(cp) = self.shape_connector_near(p, SELECT_PAD / zoom)
+            && let Some(kind) = self.segment_kind(
+                cp.pos,
+                self.active_width / zoom,
+                Some(SegmentAnchor {
+                    element_id: cp.id,
+                    connector: cp.index,
+                }),
+            )
+        {
+            self.pending = Some(Pending {
+                anchor: cp.pos,
+                kind,
+            });
+            self.connecting = Some(ConnectDrag { from: cp });
+            self.hovered_connector = Some(cp);
+            cx.notify();
+            return;
+        }
+
         // A single click on any existing element always means selection, even if
         // a drawing/text tool is currently active. This prevents accidentally
         // drawing over a shape when the user only meant to select it. A second
@@ -3705,6 +3991,14 @@ impl WhiteboardView {
             return;
         }
 
+        if self.tool == Tool::Sticky {
+            // One note per click, then back to Select (like Text in most
+            // boards) so a stray click doesn't drop another.
+            self.tool = Tool::Select;
+            self.add_sticky(p, window, cx);
+            return;
+        }
+
         if self.tool == Tool::Text {
             // A single click on existing text only selects it. Editing existing
             // content is deliberately double-click-only; clicking empty canvas
@@ -3732,6 +4026,7 @@ impl WhiteboardView {
                     label: None,
                     label_color: None,
                     styles: Vec::new(),
+                    group: None,
                     mindmap: None,
                 });
                 self.selected = vec![id];
@@ -3787,6 +4082,8 @@ impl WhiteboardView {
                             connector: cp.index,
                         }),
                         end_anchor: None,
+                        bend: 0.0,
+                        bend_at: 0.5,
                     }),
                 });
                 self.connecting = Some(ConnectDrag { from: cp });
@@ -3848,20 +4145,26 @@ impl WhiteboardView {
                 .map(|e| e.id);
             match hit {
                 Some(id) if ev.modifiers.shift => {
-                    // Shift-click toggles membership (no move).
-                    if let Some(pos) = self.selected.iter().position(|&s| s == id) {
-                        self.selected.remove(pos);
+                    // Shift-click toggles membership (no move) — a whole group
+                    // at a time.
+                    let members = self.with_group(id);
+                    if self.is_selected(id) {
+                        self.selected.retain(|s| !members.contains(s));
                     } else {
-                        self.selected.push(id);
+                        self.selected.extend(members);
                     }
                     self.drag_from = None;
                 }
                 Some(id) => {
-                    // Click an unselected element selects only it; clicking one
-                    // already in the selection keeps the group (so a drag moves
-                    // them all). Either way, arm a move.
+                    // Click an unselected element selects only it (and its
+                    // group); clicking one already in the selection keeps the
+                    // selection (so a drag moves them all). Either way, arm a move.
                     if !self.is_selected(id) {
-                        self.selected = vec![id];
+                        self.selected = self.with_group(id);
+                    }
+                    // Alt-drag copies: duplicate in place and move the copy.
+                    if ev.modifiers.alt {
+                        self.duplicate_selection(0.0, window, cx);
                     }
                     self.drag_from = Some(p);
                     // Capture the primary element's top-left so the move can drive
@@ -3920,40 +4223,20 @@ impl WhiteboardView {
             Tool::RoundRect => ElementKind::RoundRect(box0),
             Tool::Star => ElementKind::Star(box0),
             Tool::Hexagon => ElementKind::Hexagon(box0),
-            Tool::Line => ElementKind::Line(SegGeom {
-                x1: anchor[0],
-                y1: anchor[1],
-                x2: anchor[0],
-                y2: anchor[1],
-                width,
-                style: SegmentStyle::Solid,
-                start_anchor: None,
-                end_anchor: None,
-            }),
-            Tool::Arrow => ElementKind::Arrow(SegGeom {
-                x1: anchor[0],
-                y1: anchor[1],
-                x2: anchor[0],
-                y2: anchor[1],
-                width,
-                style: SegmentStyle::Solid,
-                start_anchor: None,
-                end_anchor: None,
-            }),
-            Tool::DashedArrow => ElementKind::Arrow(SegGeom {
-                x1: anchor[0],
-                y1: anchor[1],
-                x2: anchor[0],
-                y2: anchor[1],
-                width,
-                style: SegmentStyle::Dashed,
-                start_anchor: None,
-                end_anchor: None,
-            }),
+            Tool::Line
+            | Tool::Arrow
+            | Tool::DashedArrow
+            | Tool::CurvedLine
+            | Tool::CurvedArrow
+            | Tool::CurvedDashedArrow => match self.segment_kind(anchor, width, None) {
+                Some(kind) => kind,
+                None => return,
+            },
             // These tools don't create a drag-element here (handled earlier).
             Tool::Pan
             | Tool::Select
             | Tool::Text
+            | Tool::Sticky
             | Tool::MindMap
             | Tool::Flowchart
             | Tool::Embed
@@ -4010,18 +4293,38 @@ impl WhiteboardView {
         if let Some((a, b)) = self.marquee.take() {
             let (x0, x1) = (a[0].min(b[0]), a[0].max(b[0]));
             let (y0, y1) = (a[1].min(b[1]), a[1].max(b[1]));
-            for e in &self.scene.elements {
-                let bb = bbox(&e.kind);
-                let hits = bb.0 <= x1 && bb.2 >= x0 && bb.1 <= y1 && bb.3 >= y0;
-                if hits && !self.selected.contains(&e.id) {
-                    self.selected.push(e.id);
+            let hit: Vec<u64> = self
+                .scene
+                .elements
+                .iter()
+                .filter(|e| {
+                    let bb = bbox(&e.kind);
+                    bb.0 <= x1 && bb.2 >= x0 && bb.1 <= y1 && bb.3 >= y0
+                })
+                .map(|e| e.id)
+                .collect();
+            // A touched group comes along whole.
+            let whole: Vec<u64> = hit.into_iter().flat_map(|id| self.with_group(id)).collect();
+            for id in whole {
+                if !self.selected.contains(&id) {
+                    self.selected.push(id);
                 }
             }
             cx.notify();
             return;
         }
         if let Some(pending) = self.pending.take() {
-            let completed_connection = self.connecting.take().is_some();
+            let connection = self.connecting.take();
+            let completed_connection = connection.is_some();
+            // A line tool's press on a shape that never became a line: that
+            // was a click, which selects the shape.
+            if let Some(conn) = connection
+                && !committable(&pending.kind)
+                && self.tool != Tool::Select
+            {
+                self.tool = Tool::Select;
+                self.selected = self.with_group(conn.from.id);
+            }
             if committable(&pending.kind) {
                 self.push_undo();
                 let id = self.next_id;
@@ -4040,6 +4343,7 @@ impl WhiteboardView {
                     label: None,
                     label_color: self.active_text,
                     styles: Vec::new(),
+                    group: None,
                     mindmap: None,
                 });
                 if completed_connection {
@@ -4067,6 +4371,24 @@ impl WhiteboardView {
         // shouldn't also open the board context menu.
         if self.picker.is_some() && self.picker_bounds.get().contains(&ev.position) {
             return;
+        }
+        // The menu acts on the selection, so a right-click on a shape that isn't
+        // in it selects that shape first (topmost, as a left-click picks).
+        let p = self.event_to_world(ev.position);
+        let pad = SELECT_PAD / self.scene.camera.zoom.max(MIN_ZOOM);
+        let hit = self
+            .scene
+            .elements
+            .iter()
+            .rev()
+            .find(|e| hit_test(&e.kind, p[0], p[1], pad))
+            .map(|e| e.id);
+        match hit {
+            Some(id) if !self.selected.contains(&id) => self.selected = self.with_group(id),
+            Some(_) => {}
+            // Empty canvas: the menu is about the canvas (paste), not whatever
+            // happened to be selected.
+            None => self.selected.clear(),
         }
         // Show the menu when there's a selection (copy / cut / z-order / save) or
         // paste is wired (so you can paste onto empty canvas). Positioned at the click.
@@ -4097,10 +4419,19 @@ impl WhiteboardView {
         }
     }
 
-    /// Context-menu Paste.
+    /// Context-menu Paste: lands centered where the menu was opened.
     fn paste_from_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.context_menu = None;
-        self.try_paste(window, cx);
+        let at = self.context_menu.take().map(|p| {
+            self.scene
+                .camera
+                .screen_to_world(f32::from(p.x), f32::from(p.y))
+        });
+        if let Some(f) = self.on_paste.clone()
+            && let Some(json) = f(window, cx)
+            && let Ok(elems) = serde_json::from_str::<Vec<Element>>(&json)
+        {
+            self.stamp_elements_at(&elems, at.map(|(x, y)| [x, y]), window, cx);
+        }
     }
 
     fn on_middle_down(
@@ -4358,6 +4689,26 @@ impl WhiteboardView {
         }
         // Dragging a line/arrow endpoint (Shift snaps the angle to 45°, Option
         // snaps the endpoint to the grid).
+        if let Some(ep) = self.endpoint
+            && ep.which == 2
+        {
+            // The bend handle: the curve's peak follows the pointer across the
+            // line (near it, it snaps straight); with Shift it also slides
+            // along the line, moving the peak (snapping back to the middle).
+            let cur = self.event_to_world(ev.position);
+            if let Some(e) = self.scene.elements.iter_mut().find(|e| e.id == ep.id)
+                && let ElementKind::Line(s) | ElementKind::Arrow(s) = &mut e.kind
+            {
+                if ev.modifiers.shift {
+                    let at = s.bend_at_toward(cur);
+                    s.bend_at = if (at - 0.5).abs() < 0.03 { 0.5 } else { at };
+                }
+                let bend = s.bend_toward(cur);
+                s.bend = if bend.abs() < 0.03 { 0.0 } else { bend };
+            }
+            cx.notify();
+            return;
+        }
         if let Some(ep) = self.endpoint {
             let cur = self.event_to_world(ev.position);
             let shift = ev.modifiers.shift;
@@ -4490,7 +4841,8 @@ impl WhiteboardView {
                 | ElementKind::Triangle(b)
                 | ElementKind::RoundRect(b)
                 | ElementKind::Star(b)
-                | ElementKind::Hexagon(b) => {
+                | ElementKind::Hexagon(b)
+                | ElementKind::Sticky(b) => {
                     b.x = anchor[0].min(c[0]);
                     b.y = anchor[1].min(c[1]);
                     b.w = (c[0] - anchor[0]).abs();
@@ -4556,6 +4908,60 @@ impl WhiteboardView {
     /// hit-testing need. `wrap` is `None` for free text, `Some(inner_width)` for a
     /// label (which word-wraps inside its shape). `x`/`y`/`w`/`h`/`rotation` place
     /// the laid-out block in the world.
+    /// The checklist box under world point `p`: the element and the byte
+    /// offset of its `☐` / `☑`. Topmost element first.
+    fn checkbox_at(&self, p: [f32; 2]) -> Option<(u64, usize)> {
+        let has_box = |t: &str| t.contains(['☐', '☑']);
+        self.scene.elements.iter().rev().find_map(|e| {
+            let text = match &e.kind {
+                ElementKind::Text(t) => Some(t.content.as_str()),
+                _ => e.label.as_deref(),
+            };
+            if !text.is_some_and(has_box) {
+                return None; // skip the layout work for the many without one
+            }
+            let tg = self.edit_target(e.id)?;
+            let (lx, ly) = rotate_pt(p[0], p[1], tg.pivot[0], tg.pivot[1], -tg.rotation);
+            let (lx, ly) = (lx - tg.x, ly - tg.y);
+            let lh = self.font.measure("", tg.size).1;
+            list_marker_starts(&tg.content)
+                .filter(|&(_, m)| m != BULLET)
+                .find_map(|(at, _)| {
+                    let a = self
+                        .font
+                        .caret_pos_wrapped(&tg.content, tg.size, tg.wrap, at);
+                    let b = self
+                        .font
+                        .caret_pos_wrapped(&tg.content, tg.size, tg.wrap, at + 3);
+                    let slop = tg.size * 0.15;
+                    (lx >= a[0] - slop && lx <= b[0] + slop && ly >= a[1] && ly <= a[1] + lh)
+                        .then_some((e.id, at))
+                })
+        })
+    }
+
+    /// Tick or untick the box at byte `at` of element `id` (`☐` ↔ `☑`, the
+    /// same length, so styles and the caret stay put).
+    fn toggle_checkbox(&mut self, id: u64, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.push_undo();
+        let Some(el) = self.scene.elements.iter_mut().find(|e| e.id == id) else {
+            return;
+        };
+        let text = match &mut el.kind {
+            ElementKind::Text(t) => &mut t.content,
+            _ => el.label.get_or_insert_with(String::new),
+        };
+        let flipped = if text[at..].starts_with(TODO) {
+            "☑"
+        } else {
+            "☐"
+        };
+        text.replace_range(at..at + 3, flipped);
+        self.dirty = true;
+        cx.notify();
+        self.flush(window, cx);
+    }
+
     fn edit_target(&self, id: u64) -> Option<EditTarget> {
         let e = self.scene.elements.iter().find(|e| e.id == id)?;
         match &e.kind {
@@ -4706,6 +5112,15 @@ impl WhiteboardView {
         };
         let insert_start = visible_range.start;
         self.replace_range(id, visible_range.start, visible_range.end, new_text, cx);
+        // `* ` / `- ` / `[ ] ` typed at a line's start become a list marker.
+        if new_text == " "
+            && !mark_inserted_text
+            && let Some(text) = self.editing_content()
+            && let Some((start, marker)) = list_shorthand(&text, self.caret)
+        {
+            self.replace_range(id, start, self.caret, marker, cx);
+            return;
+        }
 
         self.marked_range = if mark_inserted_text && !new_text.is_empty() {
             Some(insert_start..insert_start + new_text.len())
@@ -4936,6 +5351,10 @@ impl WhiteboardView {
                         self.replace_selection(id, &text, cx);
                     }
                 }
+                // Ctrl+Home / Ctrl+End (⌘↑ / ⌘↓ on a Mac): the whole text's
+                // start / end.
+                "home" | "up" => self.move_caret(0, shift, cx),
+                "end" | "down" => self.move_caret(content.len(), shift, cx),
                 _ => cx.propagate(), // ⌘Z / ⌘W / … belong to the host
             }
             return;
@@ -4997,7 +5416,11 @@ impl WhiteboardView {
                     self.replace_range(id, self.caret, caret_right(&content, self.caret), "", cx);
                 }
             }
-            "enter" => self.replace_selection(id, "\n", cx),
+            "enter" => {
+                let (s, e) = self.sel_range();
+                let (s, e, ins) = list_enter(&content, s, e);
+                self.replace_range(id, s, e, &ins, cx);
+            }
             "tab" => cx.propagate(),
             _ => {
                 // Printable text is handled by GPUI's ElementInputHandler path.
@@ -5151,6 +5574,20 @@ impl WhiteboardView {
             // the host can paste a clipboard image instead.
             return self.try_paste(window, cx);
         }
+        if cmd && ks.key == "d" {
+            if self.selected.is_empty() {
+                return false;
+            }
+            self.duplicate_selection(20.0, window, cx);
+            return true;
+        }
+        if cmd && ks.key == "g" {
+            if self.selected.is_empty() {
+                return false;
+            }
+            self.set_grouped(!ks.modifiers.shift, window, cx);
+            return true;
+        }
         if cmd || ks.modifiers.alt {
             return false;
         }
@@ -5163,6 +5600,11 @@ impl WhiteboardView {
             "escape" if !self.selected.is_empty() => {
                 self.selected.clear();
                 cx.notify();
+            }
+            // With nothing selected, Esc puts a drawing tool down and goes back
+            // to Select, like most drawing apps.
+            "escape" if !matches!(self.tool, Tool::Select | Tool::Pan) => {
+                self.set_tool(Tool::Select, cx);
             }
             _ => return false,
         }
@@ -5183,11 +5625,23 @@ impl WhiteboardView {
             cx.notify();
             return;
         }
-        // Escape closes an open color picker or the templates modal (when the
-        // board holds focus).
-        if ev.keystroke.key == "escape" && (self.picker.is_some() || self.templates_open) {
+        // Escape closes an open context menu, color picker, tool / thickness /
+        // font flyout, or the templates modal (when the board holds focus) —
+        // and nothing else, so the selection a menu acts on survives.
+        if ev.keystroke.key == "escape"
+            && (self.context_menu.is_some()
+                || self.picker.is_some()
+                || self.templates_open
+                || self.open_group.is_some()
+                || self.width_open
+                || self.font_open)
+        {
+            self.context_menu = None;
             self.picker = None;
             self.templates_open = false;
+            self.open_group = None;
+            self.width_open = false;
+            self.font_open = false;
             cx.notify();
             return;
         }
@@ -5451,6 +5905,72 @@ fn glyph_style(s: RunStyle) -> font::GlyphStyle {
 /// auto-shrunk font size, the wrap width, and the block's world placement,
 /// centered. Shared by the paint path and the editor so the caret matches the
 /// rendered glyphs exactly.
+/// Whiteboard list markers: stored as plain characters (so search, export
+/// and copy keep them) at the start of a line, each followed by a space.
+const BULLET: &str = "• ";
+const TODO: &str = "☐ ";
+const DONE: &str = "☑ ";
+
+/// Each line of `text` that starts with a list marker: its byte offset and
+/// the marker.
+fn list_marker_starts(text: &str) -> impl Iterator<Item = (usize, &'static str)> + '_ {
+    std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .filter_map(|at| {
+            [BULLET, TODO, DONE]
+                .into_iter()
+                .find(|m| text[at..].starts_with(m))
+                .map(|m| (at, m))
+        })
+}
+
+/// After a space typed so the caret is at `caret`: when the line so far is a
+/// list shorthand — `*` / `-` for a bullet, `[ ]` / `[]` (optionally after a
+/// bullet) for a checkbox, `[x]` for a ticked one — the start of the line and
+/// the marker to put there.
+fn list_shorthand(text: &str, caret: usize) -> Option<(usize, &'static str)> {
+    let start = text[..caret].rfind('\n').map_or(0, |i| i + 1);
+    let typed = &text[start..caret];
+    let typed = typed.strip_prefix(BULLET).unwrap_or(typed);
+    let marker = match typed {
+        "* " | "- " => BULLET,
+        "[ ] " | "[] " => TODO,
+        "[x] " | "[X] " => DONE,
+        _ => return None,
+    };
+    Some((start, marker))
+}
+
+/// What Enter does over `[s, e)` in `text`: inside a list item, a new line
+/// with the next marker (an unticked box after a checkbox); on an empty
+/// item, end the list by removing its marker. Returns the range to replace
+/// and the text to put there.
+fn list_enter(text: &str, s: usize, e: usize) -> (usize, usize, String) {
+    let start = text[..s].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[e..].find('\n').map_or(text.len(), |i| e + i);
+    let Some(marker) = [BULLET, TODO, DONE]
+        .into_iter()
+        .find(|m| text[start..].starts_with(m))
+    else {
+        return (s, e, "\n".into());
+    };
+    if text[start..end].trim_end() == marker.trim_end() {
+        return (start, end, String::new());
+    }
+    let next = if marker == BULLET { BULLET } else { TODO };
+    (s, e, format!("\n{next}"))
+}
+
+/// The label as painted: verbatim while it's being edited — the caret math
+/// runs on the raw string, so a just-typed trailing space or newline must
+/// keep its place — and trimmed otherwise.
+fn label_text(label: Option<&str>, editing: bool) -> &str {
+    match label {
+        Some(l) if editing => l,
+        l => l.map_or("", str::trim),
+    }
+}
+
 fn shape_label_block(
     font: &Font,
     kind: &ElementKind,
@@ -5480,6 +6000,19 @@ fn shape_label_block(
     };
     let wrap = (bw * wf - 2.0 * LABEL_PAD).max(1.0);
     let ih = (bh * hf - 2.0 * LABEL_PAD).max(1.0);
+    // A sticky note writes from the top-left like a pad, clear of its fold.
+    if matches!(kind, ElementKind::Sticky(_)) {
+        let pad = LABEL_PAD.max(bw.min(bh) * 0.08);
+        let wrap = (bw - 2.0 * pad).max(1.0);
+        let ih = (bh - 2.0 * pad - bw.min(bh) * 0.08).max(1.0);
+        let size = font.fit_size(label, wrap, ih, TEXT_SIZE);
+        return LabelBlock {
+            x: bx + pad,
+            y: by + pad,
+            size,
+            wrap,
+        };
+    }
     let size = font.fit_size(label, wrap, ih, TEXT_SIZE);
     let (w, h) = font.measure_wrapped(label, size, Some(wrap));
     // Always horizontally centered; the triangle's band sits on the base, every
@@ -5686,7 +6219,11 @@ impl Render for WhiteboardView {
             // Disjoint field borrows (vs `&mut e.kind` below) so the text arms can
             // read the label, its color, and the styling without cloning.
             let label = e.label.as_deref();
-            let label_color = e.label_color;
+            // Same rule as `paint::thumbnail_text_outline`'s caller: a label
+            // without its own color reads on the shape's fill.
+            let label_color = e
+                .label_color
+                .or_else(|| e.fill.and_then(|f| crate::paint::readable_on(f, stroke)));
             let styles = e.styles.as_slice();
             match &mut e.kind {
                 // Page-card: a titled box (top-aligned header + hint) that links
@@ -5832,7 +6369,7 @@ impl Render for WhiteboardView {
                         // Built while editing even when empty, so the caret shows the
                         // moment you double-click (before the first keystroke).
                         let active = editing == Some(id);
-                        let text = label.map_or("", str::trim);
+                        let text = label_text(label, active);
                         let label_layout = cached_label_layout(
                             label_layout_cache,
                             &font,
@@ -6103,6 +6640,12 @@ impl Render for WhiteboardView {
                     tool_btn(Tool::Text)
                         .tooltip(self.tip(Tool::Text.label()))
                         .on_click(cx.listener(|this, _ev, _w, cx| this.set_tool(Tool::Text, cx)))
+                        .into_any_element(),
+                );
+                cats.push(
+                    tool_btn(Tool::Sticky)
+                        .tooltip(self.tip(Tool::Sticky.label()))
+                        .on_click(cx.listener(|this, _ev, _w, cx| this.set_tool(Tool::Sticky, cx)))
                         .into_any_element(),
                 );
             }
@@ -6584,6 +7127,39 @@ impl Render for WhiteboardView {
                 popover_anchor().child(row)
             });
 
+        // While the Sticky tool is armed: a row of paper colors for the next note.
+        let sticky_flyout = (self.tool == Tool::Sticky && open_group.is_none()).then(|| {
+            let mut row = div()
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .p(px(5.0))
+                .rounded(px(9.0))
+                .bg(panel_strong)
+                .shadow_lg()
+                .occlude();
+            for (i, c) in crate::paint::STICKY_COLORS.into_iter().enumerate() {
+                let mut swatch = div()
+                    .id(("wb-sticky-color", i))
+                    .size(px(22.0))
+                    .rounded(px(5.0))
+                    .bg(u32_to_hsla(c))
+                    .border_2()
+                    .border_color(if c == self.sticky_color {
+                        accent
+                    } else {
+                        gpui::transparent_black()
+                    });
+                swatch = swatch.on_click(cx.listener(move |this, _ev, window, cx| {
+                    this.focus.focus(window, cx);
+                    this.sticky_color = c;
+                    cx.notify();
+                }));
+                row = row.child(swatch);
+            }
+            popover_anchor().child(row)
+        });
+
         // The toolbar's text-formatting fly-out (the same panel as the right-click
         // submenu), shown while the "Format" button is toggled on during a text edit.
         let format_panel = (self.editing.is_some() && self.format_flyout).then(|| {
@@ -6830,7 +7406,34 @@ impl Render for WhiteboardView {
                                         this.delete_selected(window, cx);
                                     }
                                 },
-                            )));
+                            )))
+                            .child(row("wb-ctx-duplicate", "Duplicate", "⌘D").on_click(
+                                cx.listener(|this, _ev, window, cx| {
+                                    this.context_menu = None;
+                                    this.duplicate_selection(20.0, window, cx);
+                                }),
+                            ));
+                    // Group with two or more selected; Ungroup when any is grouped.
+                    let grouped = self
+                        .scene
+                        .elements
+                        .iter()
+                        .any(|e| self.selected.contains(&e.id) && e.group.is_some());
+                    if grouped {
+                        panel = panel.child(row("wb-ctx-ungroup", "Ungroup", "⌘⇧G").on_click(
+                            cx.listener(|this, _ev, window, cx| {
+                                this.context_menu = None;
+                                this.set_grouped(false, window, cx);
+                            }),
+                        ));
+                    } else if self.selected.len() > 1 {
+                        panel = panel.child(row("wb-ctx-group", "Group", "⌘G").on_click(
+                            cx.listener(|this, _ev, window, cx| {
+                                this.context_menu = None;
+                                this.set_grouped(true, window, cx);
+                            }),
+                        ));
+                    }
                 }
                 // Paste shows whenever the host wired it (so it works on empty canvas).
                 if self.on_paste.is_some() {
@@ -7472,6 +8075,7 @@ impl Render for WhiteboardView {
             .child(chrome_layer)
             .child(toolbar)
             .children(flyout)
+            .children(sticky_flyout)
             .children(format_panel)
             .children(width_flyout)
             .children(font_flyout)
@@ -7698,6 +8302,7 @@ mod tests {
                 label: None,
                 label_color: None,
                 styles: Vec::new(),
+                group: None,
                 mindmap: None,
             }],
             ..Scene::default()
@@ -7736,6 +8341,7 @@ mod tests {
                     label: None,
                     label_color: None,
                     styles: Vec::new(),
+                    group: None,
                     mindmap: None,
                 },
                 Element {
@@ -7753,6 +8359,7 @@ mod tests {
                     label: Some("hi".into()),
                     label_color: Some(0x112233ff),
                     styles: Vec::new(),
+                    group: None,
                     mindmap: None,
                 },
                 Element {
@@ -7766,12 +8373,15 @@ mod tests {
                         style: SegmentStyle::Solid,
                         start_anchor: None,
                         end_anchor: None,
+                        bend: 0.0,
+                        bend_at: 0.5,
                     }),
                     stroke: None,
                     fill: None,
                     label: None,
                     label_color: None,
                     styles: Vec::new(),
+                    group: None,
                     mindmap: None,
                 },
             ],
@@ -7800,6 +8410,50 @@ mod tests {
         let back: Element = serde_json::from_str(old).unwrap();
         assert_eq!(back.label, None);
         assert!(!serde_json::to_string(&back).unwrap().contains("label"));
+    }
+
+    #[test]
+    fn list_shorthands_enter_and_markers() {
+        assert_eq!(list_shorthand("* ", 2), Some((0, BULLET)));
+        assert_eq!(list_shorthand("ab\n- ", 5), Some((3, BULLET)));
+        assert_eq!(list_shorthand("[ ] ", 4), Some((0, TODO)));
+        assert_eq!(list_shorthand("• [] ", "• [] ".len()), Some((0, TODO)));
+        assert_eq!(list_shorthand("[x] ", 4), Some((0, DONE)));
+        assert_eq!(list_shorthand("a * ", 4), None, "only at a line's start");
+        // Enter continues a list; a ticked box continues with an empty one.
+        let t = "☑ milk";
+        assert_eq!(
+            list_enter(t, t.len(), t.len()),
+            (t.len(), t.len(), "\n☐ ".into())
+        );
+        let t = "• a";
+        assert_eq!(list_enter(t, t.len(), t.len()).2, "\n• ");
+        // Enter on an empty item ends the list.
+        let t = "• a\n• ";
+        assert_eq!(
+            list_enter(t, t.len(), t.len()),
+            ("• a\n".len(), t.len(), String::new())
+        );
+        assert_eq!(list_enter("plain", 5, 5).2, "\n");
+        let found: Vec<_> = list_marker_starts("☐ a\nb\n☑ c").collect();
+        assert_eq!(found, vec![(0, TODO), ("☐ a\nb\n".len(), DONE)]);
+    }
+
+    #[test]
+    fn label_caret_moves_on_trailing_space_and_newline() {
+        let font = Font::default();
+        let caret = |label: &str| {
+            let text = label_text(Some(label), true);
+            font.caret_pos_wrapped(text, 16.0, Some(200.0), label.len())
+        };
+        let typed = caret("ab");
+        assert!(caret("ab ")[0] > typed[0], "space moves the caret right");
+        let enter = caret("ab\n");
+        assert!(
+            enter[1] > typed[1] && enter[0] < typed[0],
+            "Enter starts a new line"
+        );
+        assert_eq!(label_text(Some(" ab \n"), false), "ab");
     }
 
     #[test]
@@ -7964,6 +8618,7 @@ mod tests {
                     ..Default::default()
                 },
             }],
+            group: None,
             mindmap: None,
         };
         let back: Element = serde_json::from_str(&serde_json::to_string(&el).unwrap()).unwrap();
@@ -8010,6 +8665,8 @@ mod tests {
             style: SegmentStyle::Solid,
             start_anchor: None,
             end_anchor: None,
+            bend: 0.0,
+            bend_at: 0.5,
         });
         assert_eq!(bbox(&k), (0.0, 0.0, 10.0, 4.0));
         translate(&mut k, 5.0, -2.0);
@@ -8203,6 +8860,8 @@ mod tests {
             style: SegmentStyle::Solid,
             start_anchor: None,
             end_anchor: None,
+            bend: 0.0,
+            bend_at: 0.5,
         });
         rotate_element(&mut seg, 0.0, 0.0, FRAC_PI_2);
         match seg {
@@ -8355,6 +9014,7 @@ mod tests {
             label: None,
             label_color: None,
             styles: Vec::new(),
+            group: None,
             mindmap: None,
         };
         let json = serde_json::to_string(&elem).unwrap();
@@ -8405,6 +9065,7 @@ mod tests {
                 label: None,
                 label_color: None,
                 styles: Vec::new(),
+                group: None,
                 mindmap: None,
             };
             let json = serde_json::to_string(&elem).unwrap();
@@ -8478,5 +9139,1003 @@ mod input_tests {
             });
             assert_eq!(content.as_deref(), Some("ab\ncd\ne"));
         });
+    }
+}
+
+/// A pass over the board's tools and editing, through GPUI's real input
+/// dispatch: the same mouse and key events a user sends, then the scene read
+/// back.
+#[cfg(test)]
+mod board_tests {
+    use super::*;
+    use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext, point, px, rgba};
+    use std::cell::RefCell;
+
+    fn style() -> WhiteboardStyleFn {
+        Rc::new(|| WhiteboardStyle {
+            bg: rgba(0xF7F7F5FF).into(),
+            grid: rgba(0xCFCFCBFF).into(),
+            text: rgba(0x6B6B66FF).into(),
+            ink: rgba(0x1F1F23FF).into(),
+            panel: rgba(0xFFFFFFFF).into(),
+            panel_strong: rgba(0xFFFFFFFF).into(),
+            accent: rgba(0xE8EEFDFF).into(),
+            selection: rgba(0x2E6BE6FF).into(),
+            swatches: vec![],
+        })
+    }
+
+    /// A focused board in a test window, laid out once.
+    fn board(
+        cx: &mut TestAppContext,
+        read_only: bool,
+    ) -> (Entity<WhiteboardView>, VisualTestContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| {
+                    let v = if read_only {
+                        WhiteboardView::new_read_only(Scene::default(), style(), cx)
+                    } else {
+                        WhiteboardView::new(Scene::default(), style(), cx)
+                    };
+                    v.focus.focus(window, cx);
+                    v
+                })
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let view = window.root(&mut cx).unwrap();
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    fn at(x: f32, y: f32) -> Point<Pixels> {
+        point(px(x), px(y))
+    }
+
+    fn drag(cx: &mut VisualTestContext, from: Point<Pixels>, to: Point<Pixels>) {
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+        let mid = point((from.x + to.x) / 2.0, (from.y + to.y) / 2.0);
+        cx.simulate_mouse_move(mid, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+    }
+
+    fn click(cx: &mut VisualTestContext, p: Point<Pixels>) {
+        cx.simulate_mouse_down(p, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(p, MouseButton::Left, Modifiers::default());
+    }
+
+    fn elements(v: &Entity<WhiteboardView>, cx: &VisualTestContext) -> Vec<Element> {
+        v.read_with(cx, |b, _| b.scene.elements.clone())
+    }
+
+    /// The x, y, w, h of a box shape.
+    fn bbox(e: &Element) -> Option<[f32; 4]> {
+        match &e.kind {
+            ElementKind::Rect(b)
+            | ElementKind::Ellipse(b)
+            | ElementKind::Diamond(b)
+            | ElementKind::Triangle(b)
+            | ElementKind::RoundRect(b)
+            | ElementKind::Star(b)
+            | ElementKind::Hexagon(b)
+            | ElementKind::Sticky(b) => Some([b.x, b.y, b.w, b.h]),
+            _ => None,
+        }
+    }
+
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 2.0
+    }
+
+    #[gpui::test]
+    fn every_shape_tool_draws_its_shape(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        let tools = ["r", "o", "d", "g", "u", "s", "x"];
+        for (i, key) in tools.iter().enumerate() {
+            cx.simulate_keystrokes(key);
+            let y = 200.0 + i as f32 * 60.0;
+            drag(&mut cx, at(100.0, y), at(200.0, y + 40.0));
+        }
+        let els = elements(&v, &cx);
+        assert_eq!(els.len(), tools.len(), "one shape per drag");
+        let kinds: Vec<&str> = els
+            .iter()
+            .map(|e| match e.kind {
+                ElementKind::Rect(_) => "rect",
+                ElementKind::Ellipse(_) => "ellipse",
+                ElementKind::Diamond(_) => "diamond",
+                ElementKind::Triangle(_) => "triangle",
+                ElementKind::RoundRect(_) => "round",
+                ElementKind::Star(_) => "star",
+                ElementKind::Hexagon(_) => "hexagon",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "rect", "ellipse", "diamond", "triangle", "round", "star", "hexagon"
+            ]
+        );
+        // The box spans the drag, in world units at 100% zoom.
+        let b = bbox(&els[0]).unwrap();
+        assert!(
+            near(b[2], 100.0) && near(b[3], 40.0),
+            "rect is the drag's size: {b:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn lines_arrows_and_pen(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("l");
+        drag(&mut cx, at(100.0, 200.0), at(300.0, 260.0));
+        cx.simulate_keystrokes("a");
+        drag(&mut cx, at(100.0, 300.0), at(300.0, 300.0));
+        cx.simulate_keystrokes("k");
+        drag(&mut cx, at(100.0, 400.0), at(300.0, 400.0));
+        cx.simulate_keystrokes("p");
+        drag(&mut cx, at(100.0, 500.0), at(300.0, 560.0));
+        let els = elements(&v, &cx);
+        assert_eq!(els.len(), 4);
+        match &els[0].kind {
+            ElementKind::Line(s) => {
+                assert!(near(s.x2 - s.x1, 200.0) && near(s.y2 - s.y1, 60.0), "{s:?}")
+            }
+            k => panic!("expected a line, got {k:?}"),
+        }
+        assert!(matches!(&els[1].kind, ElementKind::Arrow(s) if s.style == SegmentStyle::Solid));
+        assert!(matches!(&els[2].kind, ElementKind::Arrow(s) if s.style == SegmentStyle::Dashed));
+        assert!(matches!(&els[3].kind, ElementKind::Draw(st) if st.points.len() >= 2));
+    }
+
+    #[gpui::test]
+    fn select_move_delete_undo_redo(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(200.0, 260.0));
+        let before = bbox(&elements(&v, &cx)[0]).unwrap();
+        // Select it and drag it 50 right, 30 down.
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(150.0, 230.0));
+        assert_eq!(
+            v.read_with(&cx, |b, _| b.selected.len()),
+            1,
+            "click selects"
+        );
+        drag(&mut cx, at(150.0, 230.0), at(200.0, 260.0));
+        let moved = bbox(&elements(&v, &cx)[0]).unwrap();
+        assert!(
+            near(moved[0] - before[0], 50.0) && near(moved[1] - before[1], 30.0),
+            "moved by the drag: {before:?} -> {moved:?}"
+        );
+        // Delete, undo it back, redo it away again.
+        cx.simulate_keystrokes("backspace");
+        assert!(elements(&v, &cx).is_empty(), "delete removes it");
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(elements(&v, &cx).len(), 1, "undo restores it");
+        cx.simulate_keystrokes("ctrl-shift-z");
+        assert!(elements(&v, &cx).is_empty(), "redo removes it again");
+        // Undo twice more: back before the move, then before the shape.
+        cx.simulate_keystrokes("ctrl-z ctrl-z");
+        let undone = bbox(&elements(&v, &cx)[0]).unwrap();
+        assert!(
+            near(undone[0], before[0]) && near(undone[1], before[1]),
+            "move undone"
+        );
+        cx.simulate_keystrokes("ctrl-z");
+        assert!(elements(&v, &cx).is_empty(), "shape undone");
+    }
+
+    #[gpui::test]
+    fn escape_deselects(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(200.0, 260.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(150.0, 230.0));
+        cx.simulate_keystrokes("escape");
+        assert!(v.read_with(&cx, |b, _| b.selected.is_empty()));
+    }
+
+    #[gpui::test]
+    fn text_typing_and_editing_keys(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("t");
+        click(&mut cx, at(200.0, 300.0));
+        cx.simulate_input("hello");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("world");
+        cx.simulate_keystrokes("backspace left");
+        cx.simulate_input("X");
+        cx.simulate_keystrokes("escape");
+        let els = elements(&v, &cx);
+        let text = els.iter().find_map(|e| match &e.kind {
+            ElementKind::Text(t) => Some(t.content.clone()),
+            _ => None,
+        });
+        assert_eq!(text.as_deref(), Some("hello\nworXl"));
+        assert!(
+            v.read_with(&cx, |b, _| b.editing.is_none()),
+            "escape commits"
+        );
+    }
+
+    #[gpui::test]
+    fn text_select_all_and_bold(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("t");
+        click(&mut cx, at(200.0, 300.0));
+        cx.simulate_input("bold me");
+        cx.simulate_keystrokes("ctrl-a ctrl-b escape");
+        let els = elements(&v, &cx);
+        let styles = els.iter().find_map(|e| match &e.kind {
+            ElementKind::Text(_) => Some(e.styles.clone()),
+            _ => None,
+        });
+        let styles = styles.expect("a text element");
+        assert!(
+            styles
+                .iter()
+                .any(|s| s.style.bold && s.start == 0 && s.end == 7),
+            "the whole text is bold: {styles:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn copy_paste_and_z_order(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        let clip: Rc<RefCell<Option<String>>> = Rc::default();
+        v.update(&mut cx, |b, _| {
+            let w = clip.clone();
+            b.set_on_copy(Rc::new(move |json, _, _| *w.borrow_mut() = Some(json)));
+            let r = clip.clone();
+            b.set_on_paste(Rc::new(move |_, _| r.borrow().clone()));
+        });
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(200.0, 260.0));
+        cx.simulate_keystrokes("o");
+        drag(&mut cx, at(400.0, 200.0), at(500.0, 260.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(150.0, 230.0));
+        // Bring the rect (drawn first, so at the back) to the front.
+        cx.simulate_keystrokes("ctrl-shift-]");
+        let els = elements(&v, &cx);
+        assert!(
+            matches!(els.last().unwrap().kind, ElementKind::Rect(_)),
+            "rect now on top"
+        );
+        cx.simulate_keystrokes("ctrl-c");
+        assert!(clip.borrow().is_some(), "copy hands the host JSON");
+        cx.simulate_keystrokes("ctrl-v");
+        let els = elements(&v, &cx);
+        assert_eq!(els.len(), 3, "paste adds a copy");
+        assert_eq!(
+            els.iter()
+                .filter(|e| matches!(e.kind, ElementKind::Rect(_)))
+                .count(),
+            2
+        );
+    }
+
+    #[gpui::test]
+    fn scene_json_round_trip(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        for (key, y) in [("r", 200.0), ("a", 300.0), ("p", 400.0)] {
+            cx.simulate_keystrokes(key);
+            drag(&mut cx, at(100.0, y), at(220.0, y + 40.0));
+        }
+        cx.simulate_keystrokes("t");
+        click(&mut cx, at(400.0, 500.0));
+        cx.simulate_input("note");
+        cx.simulate_keystrokes("escape");
+        let json = v.read_with(&cx, |b, _| b.scene.to_json());
+        let back = Scene::from_json(&json);
+        assert_eq!(back.elements.len(), 4);
+        assert_eq!(back.to_json(), json, "JSON survives a round trip unchanged");
+    }
+
+    #[gpui::test]
+    fn read_only_board_ignores_drawing(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, true);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(200.0, 260.0));
+        assert!(elements(&v, &cx).is_empty());
+        assert_eq!(v.read_with(&cx, |b, _| b.tool), Tool::Pan);
+    }
+
+    #[gpui::test]
+    fn pan_tool_and_ctrl_wheel_zoom_move_the_camera(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("h");
+        drag(&mut cx, at(300.0, 300.0), at(360.0, 340.0));
+        let cam = v.read_with(&cx, |b, _| b.scene.camera);
+        assert!(
+            cam.x != 0.0 || cam.y != 0.0,
+            "panning moved the camera: {cam:?}"
+        );
+        let z0 = cam.zoom;
+        cx.simulate_event(gpui::ScrollEvent {
+            position: at(400.0, 400.0),
+            delta: gpui::ScrollDelta::Lines(point(0.0, 3.0)),
+            modifiers: Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let z1 = v.read_with(&cx, |b, _| b.scene.camera.zoom);
+        assert!(z1 != z0, "ctrl+wheel zooms: {z0} -> {z1}");
+    }
+
+    fn double_click(cx: &mut VisualTestContext, p: Point<Pixels>) {
+        click(cx, p);
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: MouseButton::Left,
+            position: p,
+            modifiers: Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_mouse_up(p, MouseButton::Left, Modifiers::default());
+    }
+
+    fn center(e: &Element) -> Point<Pixels> {
+        let b = bbox(e).expect("a box shape");
+        at(b[0] + b[2] / 2.0, b[1] + b[3] / 2.0)
+    }
+
+    #[gpui::test]
+    fn mind_map_enter_adds_a_sibling_and_tab_a_child(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("m");
+        click(&mut cx, at(600.0, 400.0));
+        let els = elements(&v, &cx);
+        let n0 = els.len();
+        assert!(n0 >= 2, "a seed map: root plus branches ({n0})");
+        let branch = els
+            .iter()
+            .find(|e| e.mindmap.as_ref().is_some_and(|m| m.parent.is_some()))
+            .expect("a branch node")
+            .clone();
+        let parent = branch.mindmap.as_ref().unwrap().parent;
+        double_click(&mut cx, center(&branch));
+        assert_eq!(
+            v.read_with(&cx, |b, _| b.editing),
+            Some(branch.id),
+            "double-click edits"
+        );
+        // Enter the Windows way (no key_char) — the path that once did nothing.
+        cx.simulate_event(KeyDownEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        let nodes = |els: &[Element]| -> Vec<Element> {
+            els.iter()
+                .filter(|e| e.mindmap.is_some())
+                .cloned()
+                .collect()
+        };
+        let n0 = nodes(&els).len();
+        let els = elements(&v, &cx);
+        assert_eq!(nodes(&els).len(), n0 + 1, "Enter adds a node");
+        let sibling = nodes(&els).last().unwrap().clone();
+        assert_eq!(
+            sibling.mindmap.as_ref().unwrap().parent,
+            parent,
+            "a sibling"
+        );
+        // Tab on the new node: a child of it.
+        cx.simulate_event(KeyDownEvent {
+            keystroke: gpui::Keystroke::parse("tab").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        let els = elements(&v, &cx);
+        assert_eq!(nodes(&els).len(), n0 + 2, "Tab adds a node");
+        assert_eq!(
+            nodes(&els).last().unwrap().mindmap.as_ref().unwrap().parent,
+            Some(sibling.id),
+            "a child of the node being edited"
+        );
+    }
+
+    #[gpui::test]
+    fn double_click_reedits_text_and_shape_labels(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("t");
+        click(&mut cx, at(200.0, 300.0));
+        cx.simulate_input("abc");
+        cx.simulate_keystrokes("escape");
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(400.0, 300.0), at(560.0, 380.0));
+        // Edit the text again: caret lands in it, typing appends at the end.
+        cx.simulate_keystrokes("v");
+        double_click(&mut cx, at(205.0, 308.0));
+        assert!(
+            v.read_with(&cx, |b, _| b.editing.is_some()),
+            "text re-enters editing"
+        );
+        cx.simulate_keystrokes("end");
+        cx.simulate_input("d");
+        cx.simulate_keystrokes("escape");
+        // A shape gets a label the same way.
+        double_click(&mut cx, at(480.0, 340.0));
+        cx.simulate_input("box");
+        cx.simulate_keystrokes("escape");
+        let els = elements(&v, &cx);
+        let text = els.iter().find_map(|e| match &e.kind {
+            ElementKind::Text(t) => Some(t.content.clone()),
+            _ => None,
+        });
+        assert_eq!(text.as_deref(), Some("abcd"));
+        let label = els
+            .iter()
+            .find(|e| matches!(e.kind, ElementKind::Rect(_)))
+            .and_then(|e| e.label.clone());
+        assert_eq!(label.as_deref(), Some("box"));
+    }
+
+    #[gpui::test]
+    fn marquee_selects_several_and_moves_them_together(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(200.0, 300.0), at(260.0, 340.0));
+        cx.simulate_keystrokes("o");
+        drag(&mut cx, at(320.0, 300.0), at(380.0, 340.0));
+        cx.simulate_keystrokes("v");
+        drag(&mut cx, at(150.0, 250.0), at(450.0, 400.0));
+        assert_eq!(
+            v.read_with(&cx, |b, _| b.selected.len()),
+            2,
+            "both in the marquee"
+        );
+        let before: Vec<_> = elements(&v, &cx).iter().map(|e| bbox(e).unwrap()).collect();
+        drag(&mut cx, at(230.0, 320.0), at(250.0, 360.0));
+        let after: Vec<_> = elements(&v, &cx).iter().map(|e| bbox(e).unwrap()).collect();
+        for (b, a) in before.iter().zip(&after) {
+            assert!(
+                near(a[0] - b[0], 20.0) && near(a[1] - b[1], 40.0),
+                "{b:?} -> {a:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn dragging_a_corner_resizes(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(200.0, 300.0), at(300.0, 360.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(250.0, 330.0));
+        drag(&mut cx, at(300.0, 360.0), at(340.0, 400.0));
+        let b = bbox(&elements(&v, &cx)[0]).unwrap();
+        assert!(
+            near(b[2], 140.0) && near(b[3], 100.0),
+            "corner drag resized: {b:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn connector_arrow_follows_its_shape(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(200.0, 300.0), at(300.0, 360.0));
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(500.0, 300.0), at(600.0, 360.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(250.0, 330.0));
+        // The first shape's right-hand connector button, from the same layout
+        // the paint uses.
+        let button = v.read_with(&cx, |b, _| {
+            let a = &b.scene.elements[0];
+            let origin = b.bounds.get().origin;
+            crate::paint::connector_button_centers(&a.kind, b.scene.camera, origin)
+                .into_iter()
+                .max_by(|p, q| p.x.partial_cmp(&q.x).unwrap())
+                .unwrap()
+        });
+        cx.simulate_mouse_move(button, None, Modifiers::default());
+        // Release on the second shape's left connector: the end snaps to it.
+        drag(&mut cx, button, at(502.0, 330.0));
+        let els = elements(&v, &cx);
+        let seg = els
+            .iter()
+            .find_map(|e| match &e.kind {
+                ElementKind::Arrow(s) | ElementKind::Line(s) => Some(*s),
+                _ => None,
+            })
+            .expect("a connector was drawn");
+        let (a_id, b_id) = (els[0].id, els[1].id);
+        assert_eq!(
+            seg.start_anchor.map(|x| x.element_id),
+            Some(a_id),
+            "{seg:?}"
+        );
+        assert_eq!(seg.end_anchor.map(|x| x.element_id), Some(b_id), "{seg:?}");
+        // Move the second shape 100 down: the arrow's end goes with it.
+        click(&mut cx, at(550.0, 330.0));
+        drag(&mut cx, at(550.0, 330.0), at(550.0, 430.0));
+        let moved = elements(&v, &cx)
+            .iter()
+            .find_map(|e| match &e.kind {
+                ElementKind::Arrow(s) | ElementKind::Line(s) => Some(*s),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            near(moved.y2 - seg.y2, 100.0),
+            "end followed: {seg:?} -> {moved:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn escape_puts_a_drawing_tool_down(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("t escape");
+        assert_eq!(v.read_with(&cx, |b, _| b.tool), Tool::Select);
+        // Pan (the default navigation tool) stays put.
+        cx.simulate_keystrokes("h escape");
+        assert_eq!(v.read_with(&cx, |b, _| b.tool), Tool::Pan);
+    }
+
+    #[gpui::test]
+    fn flowchart_seed_is_linked_boxes(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("f");
+        click(&mut cx, at(600.0, 400.0));
+        let els = elements(&v, &cx);
+        let boxes = els.iter().filter(|e| bbox(e).is_some()).count();
+        let links: Vec<_> = els
+            .iter()
+            .filter_map(|e| match &e.kind {
+                ElementKind::Arrow(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            boxes >= 2 && !links.is_empty(),
+            "boxes {boxes}, links {}",
+            links.len()
+        );
+        assert!(
+            links
+                .iter()
+                .all(|s| s.start_anchor.is_some() && s.end_anchor.is_some()),
+            "every flowchart arrow is attached at both ends"
+        );
+    }
+
+    #[gpui::test]
+    fn image_and_page_card_tools_ask_the_host(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        type Asked = Rc<RefCell<Vec<(&'static str, f32, f32)>>>;
+        let asked: Asked = Rc::default();
+        v.update(&mut cx, |b, _| {
+            let a = asked.clone();
+            b.set_on_place_image(Rc::new(move |x, y, _, _| {
+                a.borrow_mut().push(("image", x, y))
+            }));
+            let a = asked.clone();
+            b.set_on_place_embed(Rc::new(move |x, y, _, _| {
+                a.borrow_mut().push(("embed", x, y))
+            }));
+        });
+        cx.simulate_keystrokes("i");
+        click(&mut cx, at(300.0, 400.0));
+        v.update(&mut cx, |b, cx| b.set_tool(Tool::Embed, cx));
+        click(&mut cx, at(500.0, 450.0));
+        let asked = asked.borrow().clone();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert_eq!(asked[0].0, "image");
+        assert!(
+            near(asked[0].1, 300.0) && near(asked[0].2, 400.0),
+            "{asked:?}"
+        );
+        assert_eq!(asked[1].0, "embed");
+    }
+
+    #[gpui::test]
+    fn text_formats_toggle(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("t");
+        click(&mut cx, at(200.0, 300.0));
+        cx.simulate_input("styled");
+        cx.simulate_keystrokes("ctrl-a ctrl-i ctrl-u ctrl-shift-x");
+        let style = v.read_with(&cx, |b, _| {
+            b.scene
+                .elements
+                .iter()
+                .find(|e| matches!(e.kind, ElementKind::Text(_)))
+                .and_then(|e| e.styles.first().map(|s| s.style))
+        });
+        let st = style.expect("a styled run");
+        assert!(st.italic && st.underline && st.strike, "{st:?}");
+        // Toggling again clears it.
+        cx.simulate_keystrokes("ctrl-i");
+        let italic = v.read_with(&cx, |b, _| {
+            b.scene
+                .elements
+                .iter()
+                .find(|e| matches!(e.kind, ElementKind::Text(_)))
+                .is_some_and(|e| e.styles.iter().any(|s| s.style.italic))
+        });
+        assert!(!italic, "second ⌘I removes italic");
+    }
+
+    #[gpui::test]
+    fn right_click_selects_the_shape_under_it(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(200.0, 260.0));
+        cx.simulate_keystrokes("o");
+        drag(&mut cx, at(400.0, 200.0), at(500.0, 260.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(150.0, 230.0));
+        let ellipse = elements(&v, &cx)[1].id;
+        cx.simulate_mouse_down(at(450.0, 230.0), MouseButton::Right, Modifiers::default());
+        cx.simulate_mouse_up(at(450.0, 230.0), MouseButton::Right, Modifiers::default());
+        assert_eq!(v.read_with(&cx, |b, _| b.selected.clone()), vec![ellipse]);
+        // Esc closes the menu and nothing else: the selection stays, so the
+        // menu doesn't turn into the empty-canvas one.
+        cx.simulate_keystrokes("escape");
+        assert!(v.read_with(&cx, |b, _| b.context_menu.is_none()));
+        assert_eq!(v.read_with(&cx, |b, _| b.selected.clone()), vec![ellipse]);
+    }
+
+    #[gpui::test]
+    fn right_click_empty_canvas_clears_and_paste_lands_there(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        let clip: Rc<RefCell<Option<String>>> = Rc::default();
+        v.update(&mut cx, |b, _| {
+            let w = clip.clone();
+            b.set_on_copy(Rc::new(move |json, _, _| *w.borrow_mut() = Some(json)));
+            let r = clip.clone();
+            b.set_on_paste(Rc::new(move |_, _| r.borrow().clone()));
+        });
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(200.0, 260.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(150.0, 230.0));
+        cx.simulate_keystrokes("ctrl-c");
+        cx.simulate_mouse_down(at(600.0, 500.0), MouseButton::Right, Modifiers::default());
+        cx.simulate_mouse_up(at(600.0, 500.0), MouseButton::Right, Modifiers::default());
+        assert!(
+            v.read_with(&cx, |b, _| b.selected.is_empty()),
+            "empty canvas clears"
+        );
+        v.update_in(&mut cx, |b, window, cx| b.paste_from_menu(window, cx));
+        let pasted = bbox(elements(&v, &cx).last().unwrap()).unwrap();
+        assert!(
+            near(pasted[0] + pasted[2] / 2.0, 600.0) && near(pasted[1] + pasted[3] / 2.0, 500.0),
+            "pasted centered on the right-click: {pasted:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn connector_binds_when_released_inside_the_target(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(200.0, 300.0), at(300.0, 360.0));
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(500.0, 300.0), at(600.0, 360.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(250.0, 330.0));
+        let button = v.read_with(&cx, |b, _| {
+            let a = &b.scene.elements[0];
+            crate::paint::connector_button_centers(&a.kind, b.scene.camera, b.bounds.get().origin)
+                .into_iter()
+                .max_by(|p, q| p.x.partial_cmp(&q.x).unwrap())
+                .unwrap()
+        });
+        cx.simulate_mouse_move(button, None, Modifiers::default());
+        // The middle of the second shape: its nearest connector is lit, so
+        // that's where the arrow binds.
+        drag(&mut cx, button, at(550.0, 330.0));
+        let els = elements(&v, &cx);
+        let seg = els
+            .iter()
+            .find_map(|e| match &e.kind {
+                ElementKind::Arrow(s) => Some(*s),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            seg.end_anchor.map(|a| a.element_id),
+            Some(els[1].id),
+            "{seg:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn duplicate_and_alt_drag_copy(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(200.0, 260.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(150.0, 230.0));
+        cx.simulate_keystrokes("ctrl-d");
+        let els = elements(&v, &cx);
+        assert_eq!(els.len(), 2, "⌘D copies");
+        let (a, b) = (bbox(&els[0]).unwrap(), bbox(&els[1]).unwrap());
+        assert!(
+            near(b[0] - a[0], 20.0) && near(b[1] - a[1], 20.0),
+            "nudged: {a:?} {b:?}"
+        );
+        assert_eq!(v.read_with(&cx, |b, _| b.selected.clone()), vec![els[1].id]);
+        // Alt-drag the original: a third copy lands where it's dropped, the
+        // original stays.
+        click(&mut cx, at(110.0, 205.0));
+        cx.simulate_mouse_down(at(110.0, 205.0), MouseButton::Left, Modifiers::alt());
+        cx.simulate_mouse_move(at(410.0, 405.0), MouseButton::Left, Modifiers::alt());
+        cx.simulate_mouse_up(at(410.0, 405.0), MouseButton::Left, Modifiers::alt());
+        let els = elements(&v, &cx);
+        assert_eq!(els.len(), 3);
+        assert!(near(bbox(&els[0]).unwrap()[0], 100.0), "original stayed");
+        assert!(
+            (bbox(&els[2]).unwrap()[0] - 400.0).abs() < 12.0, // move snapping
+            "copy moved: {:?}",
+            bbox(&els[2])
+        );
+    }
+
+    #[gpui::test]
+    fn grouped_shapes_select_and_move_together(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(160.0, 240.0));
+        cx.simulate_keystrokes("o");
+        drag(&mut cx, at(300.0, 200.0), at(360.0, 240.0));
+        cx.simulate_keystrokes("v");
+        drag(&mut cx, at(50.0, 150.0), at(400.0, 300.0));
+        cx.simulate_keystrokes("ctrl-g escape");
+        // One click on the ellipse now selects both.
+        click(&mut cx, at(330.0, 220.0));
+        assert_eq!(
+            v.read_with(&cx, |b, _| b.selected.len()),
+            2,
+            "the group comes along"
+        );
+        drag(&mut cx, at(330.0, 220.0), at(330.0, 320.0));
+        let els = elements(&v, &cx);
+        assert!(near(bbox(&els[0]).unwrap()[1], 300.0), "rect moved with it");
+        // Ungroup: a click selects just one again.
+        cx.simulate_keystrokes("ctrl-shift-g escape");
+        click(&mut cx, at(330.0, 320.0));
+        assert_eq!(v.read_with(&cx, |b, _| b.selected.len()), 1);
+        // The group survives a save.
+        cx.simulate_keystrokes("ctrl-z");
+        let json = v.read_with(&cx, |b, _| b.scene.to_json());
+        assert!(json.contains("\"group\""), "group id is stored");
+    }
+
+    #[gpui::test]
+    fn a_copied_arrow_follows_its_copied_shapes(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(200.0, 300.0), at(300.0, 360.0));
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(500.0, 300.0), at(600.0, 360.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(250.0, 330.0));
+        let button = v.read_with(&cx, |b, _| {
+            let a = &b.scene.elements[0];
+            crate::paint::connector_button_centers(&a.kind, b.scene.camera, b.bounds.get().origin)
+                .into_iter()
+                .max_by(|p, q| p.x.partial_cmp(&q.x).unwrap())
+                .unwrap()
+        });
+        cx.simulate_mouse_move(button, None, Modifiers::default());
+        drag(&mut cx, button, at(550.0, 330.0));
+        // Select all three and duplicate.
+        drag(&mut cx, at(150.0, 250.0), at(650.0, 420.0));
+        cx.simulate_keystrokes("ctrl-d");
+        let els = elements(&v, &cx);
+        assert_eq!(els.len(), 6);
+        let copies: Vec<u64> = els[3..].iter().map(|e| e.id).collect();
+        let seg = els[3..]
+            .iter()
+            .find_map(|e| match &e.kind {
+                ElementKind::Arrow(s) => Some(*s),
+                _ => None,
+            })
+            .unwrap();
+        for a in [seg.start_anchor, seg.end_anchor] {
+            let id = a.expect("still attached").element_id;
+            assert!(
+                copies.contains(&id),
+                "the copy points at copies, not originals"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn sticky_note_places_and_takes_typing(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("n");
+        click(&mut cx, at(400.0, 400.0));
+        cx.simulate_input("call the plumber");
+        cx.simulate_keystrokes("escape");
+        let els = elements(&v, &cx);
+        assert_eq!(els.len(), 1);
+        let b = bbox(&els[0]).unwrap();
+        assert!(
+            near(b[0] + b[2] / 2.0, 400.0) && near(b[2], b[3]),
+            "a square on the click: {b:?}"
+        );
+        assert_eq!(els[0].label.as_deref(), Some("call the plumber"));
+        assert!(
+            matches!(els[0].kind, ElementKind::Sticky(_)),
+            "a sticky, not a rect"
+        );
+        assert!(els[0].fill.is_some(), "a filled note");
+        // Its text starts top-left, not centered.
+        let blk = shape_label_block(&Font::default(), &els[0].kind, b[0], b[1], b[2], b[3], "hi");
+        assert!(blk.x - b[0] < b[2] * 0.15 && blk.y - b[1] < b[3] * 0.15);
+        // One note per click: the tool goes back to Select.
+        assert_eq!(v.read_with(&cx, |b, _| b.tool()), Tool::Select);
+        cx.simulate_keystrokes("escape");
+        click(&mut cx, at(700.0, 400.0));
+        assert_eq!(elements(&v, &cx).len(), 1);
+    }
+
+    #[gpui::test]
+    fn checklist_types_continues_and_ticks(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("t");
+        click(&mut cx, at(300.0, 300.0));
+        cx.simulate_input("[ ] milk");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("eggs");
+        cx.simulate_keystrokes("enter enter");
+        cx.simulate_input("* tea");
+        cx.simulate_keystrokes("escape");
+        let text = |cx: &mut VisualTestContext| match &elements(&v, cx)[0].kind {
+            ElementKind::Text(t) => (t.content.clone(), t.x, t.y),
+            _ => panic!("a text element"),
+        };
+        let (content, x, y) = text(&mut cx);
+        assert_eq!(content, "☐ milk\n☐ eggs\n• tea");
+        // Clicking the first box ticks it.
+        click(&mut cx, at(x + 4.0, y + 6.0));
+        assert_eq!(text(&mut cx).0, "☑ milk\n☐ eggs\n• tea");
+    }
+
+    #[gpui::test]
+    fn curved_tools_and_the_bend_handle(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        let seg = |cx: &mut VisualTestContext, i: usize| match elements(&v, cx)[i].kind {
+            ElementKind::Line(s) | ElementKind::Arrow(s) => s,
+            _ => panic!("a segment"),
+        };
+        // A curved arrow is born bent, and its bounds take in the bulge.
+        v.update(&mut cx, |b, cx| b.set_tool(Tool::CurvedArrow, cx));
+        drag(&mut cx, at(100.0, 400.0), at(300.0, 400.0));
+        let s = seg(&mut cx, 0);
+        assert_eq!(s.bend, CURVED_TOOL_BEND);
+        let (_, _, _, max_y) = crate::geometry::bbox(&elements(&v, &cx)[0].kind);
+        assert!(max_y > 415.0, "bounds include the curve: {max_y}");
+        // A straight line bends by dragging its middle handle…
+        cx.simulate_keystrokes("l");
+        drag(&mut cx, at(100.0, 200.0), at(300.0, 200.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(150.0, 200.0));
+        drag(&mut cx, at(200.0, 200.0), at(200.0, 150.0));
+        let s = seg(&mut cx, 1);
+        assert!(
+            (s.bend + 0.25).abs() < 0.02,
+            "bent toward the pointer: {}",
+            s.bend
+        );
+        let mid = s.bend_point();
+        assert!((mid[1] - 150.0).abs() < 2.0, "the curve passes the pointer");
+        // With Shift the peak also slides along the line; the handle stays
+        // the curve's apex (its farthest point from the line).
+        let shift = Modifiers::shift();
+        cx.simulate_mouse_down(at(mid[0], mid[1]), MouseButton::Left, shift);
+        cx.simulate_mouse_move(at(150.0, 160.0), MouseButton::Left, shift);
+        cx.simulate_mouse_move(at(150.0, 150.0), MouseButton::Left, shift);
+        cx.simulate_mouse_up(at(150.0, 150.0), MouseButton::Left, shift);
+        let s = seg(&mut cx, 1);
+        assert!(
+            (s.bend_at - 0.25).abs() < 0.02,
+            "peak a quarter along: {}",
+            s.bend_at
+        );
+        let pts = s.points(24);
+        let apex = pts
+            .iter()
+            .copied()
+            .max_by(|a, b| (200.0 - a[1]).total_cmp(&(200.0 - b[1])))
+            .unwrap();
+        assert!(
+            (apex[0] - 150.0).abs() < 4.0 && (apex[1] - 150.0).abs() < 1.0,
+            "the apex is under the pointer: {apex:?}"
+        );
+        // The peak can't slide so far that the curve hooks past an end.
+        assert_eq!(s.bend_at_toward([295.0, 150.0]), 0.75);
+        // …and snaps back straight near the line.
+        let mid = s.bend_point();
+        drag(&mut cx, at(mid[0], mid[1]), at(150.0, 202.0));
+        assert_eq!(seg(&mut cx, 1).bend, 0.0);
+        // Exports draw it as a curve.
+        let svg = v.read_with(&cx, |b, _| {
+            b.scene()
+                .to_drawing(&b.font, gpui::black())
+                .unwrap()
+                .to_svg(None, |_| None)
+        });
+        assert!(svg.contains('Q'), "a quadratic curve in the SVG");
+    }
+
+    #[gpui::test]
+    fn line_tools_draw_from_a_shape_and_a_click_still_selects(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(200.0, 260.0));
+        let rect = elements(&v, &cx)[0].id;
+        // Pressing inside the rect with a line tool draws from its nearest
+        // connector, bound there.
+        v.update(&mut cx, |b, cx| b.set_tool(Tool::CurvedArrow, cx));
+        drag(&mut cx, at(190.0, 230.0), at(400.0, 300.0));
+        let els = elements(&v, &cx);
+        assert_eq!(els.len(), 2);
+        let ElementKind::Arrow(s) = els[1].kind else {
+            panic!("an arrow")
+        };
+        assert_eq!(s.start_anchor.map(|a| a.element_id), Some(rect));
+        assert!(s.bend != 0.0, "in the curved tool's look");
+        // A click on the rect (no drag) still just selects it.
+        cx.simulate_keystrokes("a");
+        click(&mut cx, at(150.0, 230.0));
+        assert_eq!(elements(&v, &cx).len(), 2);
+        assert_eq!(v.read_with(&cx, |b, _| b.selected.clone()), vec![rect]);
+        assert_eq!(v.read_with(&cx, |b, _| b.tool()), Tool::Select);
+    }
+
+    #[gpui::test]
+    fn ctrl_home_and_end_jump_to_the_text_ends(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("t");
+        click(&mut cx, at(300.0, 300.0));
+        cx.simulate_input("one");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("two");
+        cx.simulate_keystrokes("ctrl-home");
+        cx.simulate_input("<");
+        cx.simulate_keystrokes("ctrl-end");
+        cx.simulate_input(">");
+        cx.simulate_keystrokes("escape");
+        let ElementKind::Text(t) = &elements(&v, &cx)[0].kind else {
+            panic!("a text element")
+        };
+        assert_eq!(t.content, "<one\ntwo>");
+    }
+
+    #[gpui::test]
+    fn svg_export_has_every_kind(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        for (key, y) in [("r", 200.0), ("o", 300.0), ("a", 400.0), ("p", 500.0)] {
+            cx.simulate_keystrokes(key);
+            drag(&mut cx, at(100.0, y), at(220.0, y + 40.0));
+        }
+        cx.simulate_keystrokes("t");
+        click(&mut cx, at(400.0, 500.0));
+        cx.simulate_input("hi");
+        cx.simulate_keystrokes("escape");
+        let d = v
+            .read_with(&cx, |b, _| b.scene().to_drawing(&b.font, gpui::black()))
+            .expect("a drawing");
+        // Bounds cover the content plus padding.
+        assert!(d.bounds[0] < 100.0 && d.bounds[1] < 200.0 && d.bounds[2] > 300.0);
+        let svg = d.to_svg(Some(0xFFFFFFFF), |_| None);
+        assert!(svg.starts_with("<svg") && svg.trim_end().ends_with("</svg>"));
+        // rect, ellipse, arrow line + head, pen stroke, text glyphs.
+        assert!(svg.matches("<path").count() >= 6, "{svg}");
+        assert!(svg.contains("stroke-linecap"), "strokes are styled");
     }
 }

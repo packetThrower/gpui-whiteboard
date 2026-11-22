@@ -16,11 +16,16 @@ world-space `f32` (see [`Camera`](#camera)).
 | [`Scene`](#scene) | struct | `{ camera, elements }` | The board document — everything persisted |
 | [`Scene::from_json`](#scenefrom_json) | assoc fn | `fn from_json(s: &str) -> Self` | Parse stored JSON; empty board on bad input |
 | [`Scene::to_json`](#sceneto_json) | method | `fn to_json(&self) -> String` | Serialize for persistence |
-| [`Element`](#element) | struct | `{ id, kind, stroke, fill, label, label_color, styles, mindmap }` | One board element |
-| [`ElementKind`](#elementkind) | enum | 13 variants | What an element is (pen stroke, shape, text, …) |
+| [`Scene::to_drawing`](#export) | method | `fn to_drawing(&self, font: &Font, ink: Hsla) -> Option<Drawing>` | The board as vector paths for PNG / SVG export |
+| [`Drawing`](#export) | struct | `{ bounds, items }` | A board ready to export; `to_svg` writes an SVG |
+| [`DrawItem`](#export) | enum | `Path \| Image` | One thing to draw |
+| [`Affine`](#export) | type alias | `[f32; 6]` | A 2-D transform (SVG `matrix`) |
+| [`Seg`](#export) | enum | `Move \| Line \| Quad \| Cubic \| Close` | One path segment |
+| [`Element`](#element) | struct | `{ id, kind, stroke, fill, label, label_color, styles, mindmap, group }` | One board element |
+| [`ElementKind`](#elementkind) | enum | 14 variants | What an element is (pen stroke, shape, text, …) |
 | [`Stroke`](#stroke) | struct | `{ points, width }` | Freehand pen geometry |
 | [`BoxGeom`](#boxgeom) | struct | `{ x, y, w, h, width, rotation }` | Box-shape geometry (rect/ellipse/…) |
-| [`SegGeom`](#seggeom) | struct | `{ x1, y1, x2, y2, width, style, start_anchor, end_anchor }` | Line / arrow geometry |
+| [`SegGeom`](#seggeom) | struct | `{ x1, y1, x2, y2, width, style, start_anchor, end_anchor, bend, bend_at }` | Line / arrow geometry, straight or curved |
 | [`SegmentStyle`](#segmentstyle) | enum | `Solid \| Dashed` | A line/arrow's stroke style |
 | [`SegmentAnchor`](#segmentanchor) | struct | `{ element_id, connector }` | A segment endpoint bound to a shape |
 | [`MindMapNodeMeta`](#mindmapnodemeta) | struct | `{ parent, side, order, root_direction, connector_style }` | Mind-map metadata on an element |
@@ -40,7 +45,7 @@ world-space `f32` (see [`Camera`](#camera)).
 | [`StyleSpan`](#stylespan) | struct | `{ start, end, style }` | A formatting run over a byte range |
 | [`RunStyle`](#runstyle) | struct | `{ bold, italic, underline, strike, highlight }` | The formatting of a run of characters |
 | [`Format`](#format) | enum | `Bold \| Italic \| Underline \| Strike` | A toggleable boolean format |
-| [`Tool`](#tool) | enum | 15 variants | The active tool (UI state, not persisted) |
+| [`Tool`](#tool) | enum | 22 variants | The active tool (UI state, not persisted) |
 | [`WhiteboardStyle`](#whiteboardstyle) | struct | 9 fields | Theme colors, read at paint time |
 | [`WhiteboardStyleFn`](#whiteboardstylefn) | type alias | `Rc<dyn Fn() -> WhiteboardStyle>` | The host's theme closure |
 | [`ChangeFn`](#changefn) | type alias | `Rc<dyn Fn(String, &mut Window, &mut App)>` | Persist-on-change hook |
@@ -199,6 +204,8 @@ pub struct Element {
     pub label: Option<String>,
     pub label_color: Option<u32>,
     pub styles: Vec<StyleSpan>,
+    pub mindmap: Option<MindMapNodeMeta>,
+    pub group: Option<u64>,
 }
 ```
 
@@ -215,8 +222,9 @@ One board element: a stable id plus its geometry/kind and appearance.
 | `label` | `Option<String>` | Centered text label for closed shapes, word-wrapped and auto-shrunk to the shape's *inscribed* area. `None`/empty = no label; ignored by non-shape kinds. |
 | `label_color` | `Option<u32>` | Color of `label`; `None` follows `stroke` (theme ink if that's unset too). |
 | `styles` | `Vec<StyleSpan>` | Rich-text runs over the element's text (a Text element's content, or a shape's label). Kept sorted, non-overlapping, non-plain; empty = unstyled. |
+| `group` | `Option<u64>` | Group id (⌘G): elements sharing one select, move and copy together. `None` = ungrouped. Copies get a fresh id. |
 
-**Serialization** — `stroke` / `fill` / `label` / `label_color` are omitted
+**Serialization** — `stroke` / `fill` / `label` / `label_color` / `group` are omitted
 when `None`, `styles` when empty; all take defaults on load, so pre-feature
 boards keep loading.
 
@@ -235,6 +243,7 @@ pub enum ElementKind {
     RoundRect(BoxGeom),
     Star(BoxGeom),
     Hexagon(BoxGeom),
+    Sticky(BoxGeom),
     Line(SegGeom),
     Arrow(SegGeom),
     Text(TextGeom),
@@ -251,6 +260,7 @@ The kinds of thing a board can hold.
 | --- | --- | --- |
 | `Draw` | [`Stroke`](#stroke) | Freehand pen stroke |
 | `Rect` / `Ellipse` / `Diamond` / `Triangle` / `RoundRect` / `Star` / `Hexagon` | [`BoxGeom`](#boxgeom) | Closed shapes (fillable, labelable, rotatable) |
+| `Sticky` | [`BoxGeom`](#boxgeom) | A sticky note: paper in its `fill` color with a folded corner and a soft shadow, no outline; its label is written from the top-left |
 | `Line` / `Arrow` | [`SegGeom`](#seggeom) | Straight connectors (arrow has a head at `(x2, y2)`) |
 | `Text` | [`TextGeom`](#textgeom) | Free text |
 | `Embed` | [`EmbedGeom`](#embedgeom) | Page-card linking to a host page |
@@ -320,11 +330,21 @@ pub struct SegGeom {
     pub style: SegmentStyle,               // serde default: Solid
     pub start_anchor: Option<SegmentAnchor>, // serde default: None
     pub end_anchor: Option<SegmentAnchor>,   // serde default: None
+    pub bend: f32,                           // serde default: 0 (straight)
+    pub bend_at: f32,                        // serde default: 0.5 (symmetric)
+}
+
+impl SegGeom {
+    pub fn control(&self) -> Option<[f32; 2]>;
+    pub fn bend_point(&self) -> [f32; 2];
+    pub fn bend_toward(&self, p: [f32; 2]) -> f32;
+    pub fn bend_at_toward(&self, p: [f32; 2]) -> f32;
+    pub fn points(&self, n: usize) -> Vec<[f32; 2]>;
 }
 ```
 
 A directed segment (line / arrow), world-space. An arrow's head sits at
-`(x2, y2)`. All three newer fields are serde-defaulted, so boards saved before
+`(x2, y2)`. All five newer fields are serde-defaulted, so boards saved before
 they existed keep loading.
 
 **Fields**
@@ -336,6 +356,15 @@ they existed keep loading.
 | `width` | `f32` | Stroke width, world units. |
 | `style` | [`SegmentStyle`](#segmentstyle) | Solid (default) or dashed stroke. |
 | `start_anchor`, `end_anchor` | `Option<SegmentAnchor>` | When set, the endpoint is BOUND to a shape's connector point and follows it as the shape moves/resizes/rotates; moving the segment itself detaches. Endpoints snap to hovered connector points while drawing. |
+| `bend` | `f32` | How far the line bows: the curve's middle sits `bend × length` off the straight line's middle (the sign picks the side). Relative to the length, so a bound curve keeps its shape as its shapes move. `0` = straight; omitted from JSON when 0. Drawn as a quadratic Bézier. |
+| `bend_at` | `f32` | Where along the line the curve peaks, as a fraction from `(x1, y1)`: `0.5` = symmetric (omitted from JSON). Off-center skews the curve toward that end; the handle stays its apex (farthest point from the line). Clamped to 0.25–0.75, where the curve never overshoots an end. |
+
+**Methods** — `control` is the curve's Bézier control point (`None` when
+straight); `bend_point` is the curve's peak, where the bend handle sits;
+`bend_toward(p)` is the `bend` that puts the peak nearest `p` (keeping
+`bend_at`); `bend_at_toward(p)` slides the peak along the line toward `p` (0.25–0.75); `points(n)`
+samples `n + 1` points along the line, ends included (just the two ends when
+straight).
 
 ---
 
@@ -658,13 +687,13 @@ normally never construct one.
 pub enum Tool {
     Pan, Select, Pen,
     Rect, Ellipse, Diamond, Triangle, RoundRect, Star, Hexagon,
-    Line, Arrow, Text, Embed, Image,
+    Line, Arrow, DashedArrow, CurvedLine, CurvedArrow, CurvedDashedArrow, Text, Sticky, MindMap, Flowchart, Embed, Image,
 }
 ```
 
 The active tool. UI state — not part of the persisted scene. `Pan` is the
 default (navigation before drawing). The view renders its own toolbar for
-these and handles their single-key shortcuts (`H V P R O D G U S X L A T I`;
+these and handles their single-key shortcuts (`H V P R O D G U S X L A T N I`;
 `Embed` has no key) — use
 [`set_tool`](#whiteboardviewset_tool)/[`tool`](#whiteboardviewtool) only to
 drive tools from your own chrome.
@@ -1482,6 +1511,43 @@ elements.
 - Invalid JSON is silently ignored (no-op); an empty element list is a no-op.
 - Unlike `add_embed`/`add_image_at`, this **does** push undo *and* fire
   [`ChangeFn`](#changefn) — it's driven by user gestures, not mid-host-update.
+
+---
+
+## Export
+
+```rust
+impl Scene {
+    pub fn to_drawing(&self, font: &Font, ink: Hsla) -> Option<Drawing>;
+}
+pub struct Drawing { pub bounds: [f32; 4], pub items: Vec<DrawItem> }
+pub enum DrawItem {
+    Path { segs: Vec<Seg>, fill: Option<u32>, stroke: Option<(u32, f32, bool)>, transform: Affine },
+    Image { src: String, rect: [f32; 4], transform: Affine },
+}
+pub type Affine = [f32; 6];
+impl Drawing {
+    pub fn to_svg(&self, background: Option<u32>, image_href: impl Fn(&str) -> Option<String>) -> String;
+}
+```
+
+The whole board as plain vector data, so a host can save it as SVG or
+rasterize it (e.g. with tiny-skia) without a window. Every element kind is
+covered: shapes, pen strokes, lines and arrows (with heads, dashes, curved and
+elbow connectors), and text as glyph outlines in `font`. Text decorations
+(underline / strike / highlight) are not exported yet.
+
+- `to_drawing` — `None` for an empty board. `ink` colors whatever has no color
+  of its own; pass a dark one for a light background (a dark theme's ink is
+  white). Pass the board's own [`Font`](#font) so text matches the canvas.
+- `bounds` — `[x, y, w, h]` in world units: the content plus 32 units of padding.
+- `DrawItem::Path` — `segs` (in [`Seg`](#font) form) after `transform`; `stroke`
+  is `(color, width, dashed)` with round caps and joins. Fill uses the nonzero rule.
+- `DrawItem::Image` — the host-managed `src` stretched over `rect` (`[x, y, w, h]`)
+  after `transform`.
+- `to_svg` — an SVG document; `background` paints behind everything (`None` =
+  transparent). `image_href` turns an image `src` into an `href` (a `data:` URI
+  keeps the file self-contained); images it returns `None` for are left out.
 
 ---
 

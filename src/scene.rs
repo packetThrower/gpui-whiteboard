@@ -79,6 +79,10 @@ pub struct Element {
     /// this; lines stay regular anchored arrows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mindmap: Option<MindMapNodeMeta>,
+    /// Elements sharing a group id select, move and copy as one (⌘G / ⌘⇧G).
+    /// `None` = ungrouped. Absent in older boards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -366,6 +370,9 @@ pub enum ElementKind {
     RoundRect(BoxGeom),
     Star(BoxGeom),
     Hexagon(BoxGeom),
+    /// A sticky note: a paper square with a folded corner and a soft shadow,
+    /// its label written from the top-left.
+    Sticky(BoxGeom),
     Line(SegGeom),
     Arrow(SegGeom),
     Text(TextGeom),
@@ -467,6 +474,106 @@ pub struct SegGeom {
     /// Attachment for the second endpoint. Absent in older boards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_anchor: Option<SegmentAnchor>,
+    /// How far the line bows: its middle sits `bend × length` off the
+    /// straight line's middle, to one side (the sign picks which). Relative to
+    /// the length, so a curve keeps its shape as its ends move. 0 = straight.
+    /// Absent in older boards.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bend: f32,
+    /// Where along the line the curve peaks, as a fraction of the way from
+    /// (x1, y1) to (x2, y2): 0.5 (the default) is symmetric; off-center skews
+    /// the curve toward that end. Kept within 0.25–0.75, where the curve never overshoots an end. Absent in older
+    /// boards.
+    #[serde(default = "half", skip_serializing_if = "is_half")]
+    pub bend_at: f32,
+}
+
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
+}
+
+fn half() -> f32 {
+    0.5
+}
+
+fn is_half(v: &f32) -> bool {
+    *v == 0.5
+}
+
+impl SegGeom {
+    /// The quadratic Bézier control point of a bent segment, chosen so
+    /// [`bend_point`](Self::bend_point) is the curve's apex — its farthest
+    /// point from the straight line (a quadratic's apex is always its `t =
+    /// 0.5` point, so the control point is `2 × apex − chord middle`).
+    /// `None` when straight.
+    pub fn control(&self) -> Option<[f32; 2]> {
+        (self.bend != 0.0).then(|| {
+            let [px, py] = self.bend_point();
+            [
+                2.0 * px - (self.x1 + self.x2) / 2.0,
+                2.0 * py - (self.y1 + self.y2) / 2.0,
+            ]
+        })
+    }
+
+    /// `bend_at`, kept within 0.25–0.75: past that the control point lands
+    /// beyond an end and the curve hooks back.
+    fn bend_at(&self) -> f32 {
+        self.bend_at.clamp(0.25, 0.75)
+    }
+
+    /// The curve's apex — `bend_at` of the way along the line, `bend × length`
+    /// off it — where the bend handle sits (on the line when straight).
+    pub fn bend_point(&self) -> [f32; 2] {
+        let (dx, dy) = (self.x2 - self.x1, self.y2 - self.y1);
+        let a = self.bend_at();
+        [
+            self.x1 + dx * a - dy * self.bend,
+            self.y1 + dy * a + dx * self.bend,
+        ]
+    }
+
+    /// The `bend` that puts the curve's peak nearest world point `p`, keeping
+    /// where along the line it sits.
+    pub fn bend_toward(&self, p: [f32; 2]) -> f32 {
+        let (dx, dy) = (self.x2 - self.x1, self.y2 - self.y1);
+        let len2 = dx * dx + dy * dy;
+        if len2 < 1e-6 {
+            return 0.0;
+        }
+        let a = self.bend_at();
+        let (mx, my) = (self.x1 + dx * a, self.y1 + dy * a);
+        ((p[0] - mx) * -dy + (p[1] - my) * dx) / len2
+    }
+
+    /// The `bend_at` that slides the curve's peak along the line toward world
+    /// point `p` (clamped to 0.25–0.75).
+    pub fn bend_at_toward(&self, p: [f32; 2]) -> f32 {
+        let (dx, dy) = (self.x2 - self.x1, self.y2 - self.y1);
+        let len2 = dx * dx + dy * dy;
+        if len2 < 1e-6 {
+            return 0.5;
+        }
+        (((p[0] - self.x1) * dx + (p[1] - self.y1) * dy) / len2).clamp(0.25, 0.75)
+    }
+
+    /// `n + 1` points along the line, ends included.
+    pub fn points(&self, n: usize) -> Vec<[f32; 2]> {
+        let (p1, p2) = ([self.x1, self.y1], [self.x2, self.y2]);
+        let Some(c) = self.control() else {
+            return vec![p1, p2];
+        };
+        (0..=n)
+            .map(|i| {
+                let t = i as f32 / n as f32;
+                let u = 1.0 - t;
+                [
+                    u * u * p1[0] + 2.0 * u * t * c[0] + t * t * p2[0],
+                    u * u * p1[1] + 2.0 * u * t * c[1] + t * t * p2[1],
+                ]
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

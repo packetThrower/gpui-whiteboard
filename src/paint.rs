@@ -23,6 +23,22 @@ pub(crate) fn u32_to_hsla(c: u32) -> Hsla {
     rgba(c).into()
 }
 
+/// Dark or light text for an opaque `fill` when `text` lacks contrast on it;
+/// `None` when `text` already reads or the fill is see-through (the canvas
+/// shows, and the theme ink is made for that).
+pub(crate) fn readable_on(fill: u32, text: Hsla) -> Option<u32> {
+    let lum = |c: Rgba| 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+    let f = Rgba::from(u32_to_hsla(fill));
+    if f.a < 0.6 {
+        return None;
+    }
+    let (lf, lt) = (lum(f), lum(Rgba::from(text)));
+    if (lf - lt).abs() >= 0.4 {
+        return None;
+    }
+    Some(if lf > 0.5 { 0x1F1F23FF } else { 0xF5F5F5FF })
+}
+
 /// A gpui `Hsla` packed into `0xRRGGBBAA` (used to store theme swatches).
 pub(crate) fn hsla_to_u32(c: Hsla) -> u32 {
     let r = Rgba::from(c);
@@ -231,7 +247,12 @@ pub(crate) fn build_thumbnail_layers(
         let stroke = e.stroke.map_or(ink, u32_to_hsla);
         let fill = e.fill.map(u32_to_hsla);
         let label = e.label.as_deref();
-        let label_color = e.label_color;
+        // A label with no color of its own takes the stroke color, unless that
+        // wouldn't read on the shape's fill (a template's pastel box in a dark
+        // theme, where the stroke falls back to light ink).
+        let label_color = e
+            .label_color
+            .or_else(|| e.fill.and_then(|f| readable_on(f, stroke)));
         let styles = e.styles.as_slice();
         match &e.kind {
             ElementKind::Embed(em) => {
@@ -816,6 +837,7 @@ pub(crate) fn paint_element(
         ElementKind::Hexagon(b) => {
             paint_box_polygon(b, &hexagon_unit(), cam, origin, ink, fill, window)
         }
+        ElementKind::Sticky(b) => paint_sticky(b, cam, origin, fill, window),
         ElementKind::Line(s) => paint_segment(
             s,
             false,
@@ -994,8 +1016,8 @@ pub(crate) fn paint_ellipse(
 /// Vertices of box-fitting polygons in box-relative coords: `(±1, ±1)` is the
 /// box edge, `(0, 0)` the center. Scaled to the half-extents, rotated about the
 /// center, and projected by [`paint_box_polygon`].
-const DIAMOND_UNIT: [(f32, f32); 4] = [(0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)];
-const TRIANGLE_UNIT: [(f32, f32); 3] = [(0.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+pub(crate) const DIAMOND_UNIT: [(f32, f32); 4] = [(0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)];
+pub(crate) const TRIANGLE_UNIT: [(f32, f32); 3] = [(0.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
 
 /// A 5-point star (outer radius 1, inner 0.382), point-up.
 pub(crate) fn star_unit() -> [(f32, f32); 10] {
@@ -1065,6 +1087,71 @@ pub(crate) fn paint_box_polygon(
     }
 }
 
+/// The default sticky-note paper (pale yellow) and the swatch row's choices.
+pub(crate) const STICKY_COLORS: [u32; 5] =
+    [0xFEF3A0FF, 0xFFC9DEFF, 0xBFE3FFFF, 0xC8F0C0FF, 0xFFD6A5FF];
+
+/// A sticky note's paper (`body`, the square less its folded corner) and the
+/// fold (`flap`), in unrotated world space. Shared by the canvas and export.
+pub(crate) fn sticky_parts(b: &BoxGeom) -> ([[f32; 2]; 5], [[f32; 2]; 3]) {
+    let f = b.w.abs().min(b.h.abs()) * 0.16;
+    let (x0, y0, x1, y1) = (b.x, b.y, b.x + b.w, b.y + b.h);
+    (
+        [[x0, y0], [x1, y0], [x1, y1 - f], [x1 - f, y1], [x0, y1]],
+        [[x1, y1 - f], [x1 - f, y1 - f], [x1 - f, y1]],
+    )
+}
+
+/// The fold's shade: the paper a little darker.
+pub(crate) fn sticky_flap(paper: Hsla) -> Hsla {
+    Hsla {
+        l: paper.l * 0.82,
+        ..paper
+    }
+}
+
+/// A sticky note: a soft two-layer shadow, the paper, and its folded corner
+/// — no outline, the shadow carries the edge.
+pub(crate) fn paint_sticky(
+    b: &BoxGeom,
+    cam: Camera,
+    origin: Point<Pixels>,
+    fill: Option<Hsla>,
+    window: &mut Window,
+) {
+    let (cx, cy) = (b.x + b.w / 2.0, b.y + b.h / 2.0);
+    let poly = |pts: &[[f32; 2]], dx: f32, dy: f32, color: Hsla, window: &mut Window| {
+        let mut pb = PathBuilder::fill();
+        for (i, p) in pts.iter().enumerate() {
+            let (wx, wy) = rotate_pt(p[0], p[1], cx, cy, b.rotation);
+            let at = to_screen(wx + dx, wy + dy, cam, origin);
+            if i == 0 {
+                pb.move_to(at);
+            } else {
+                pb.line_to(at);
+            }
+        }
+        pb.close();
+        if let Ok(path) = pb.build() {
+            window.paint_path(path, color);
+        }
+    };
+    let (body, flap) = sticky_parts(b);
+    let side = b.w.abs().min(b.h.abs());
+    let paper = fill.unwrap_or_else(|| u32_to_hsla(STICKY_COLORS[0]));
+    for (k, alpha) in [(0.045, 0.06), (0.022, 0.12)] {
+        poly(
+            &body,
+            side * k * 0.4,
+            side * k,
+            gpui::black().opacity(alpha),
+            window,
+        );
+    }
+    poly(&body, 0.0, 0.0, paper, window);
+    poly(&flap, 0.0, 0.0, sticky_flap(paper), window);
+}
+
 /// A rounded rectangle: straight edges joined by quarter-circle corners (radius
 /// = 20% of the shorter side), rotated about the center like [`paint_rect`].
 pub(crate) fn paint_round_rect(
@@ -1129,10 +1216,21 @@ pub(crate) fn paint_segment(
     let mut points = vec![p1f];
     let (dxw, _dyw) = (seg.x2 - seg.x1, seg.y2 - seg.y1);
     let (end_dx, end_dy) = match style {
-        MindMapConnectorStyle::Straight => {
-            points.push(p2f);
-            (p2f[0] - p1f[0], p2f[1] - p1f[1])
-        }
+        MindMapConnectorStyle::Straight => match seg.control() {
+            // A bent line: sample the curve; the head follows its end tangent.
+            Some(c) => {
+                for p in &seg.points(24)[1..] {
+                    let s = to_screen(p[0], p[1], cam, origin);
+                    points.push([f32::from(s.x), f32::from(s.y)]);
+                }
+                let c = to_screen(c[0], c[1], cam, origin);
+                (p2f[0] - f32::from(c.x), p2f[1] - f32::from(c.y))
+            }
+            None => {
+                points.push(p2f);
+                (p2f[0] - p1f[0], p2f[1] - p1f[1])
+            }
+        },
         MindMapConnectorStyle::Bezier => {
             let cx1 = seg.x1 + dxw * 0.35;
             let cy1 = seg.y1;
@@ -1372,10 +1470,12 @@ pub(crate) fn paint_selection(
     color: Hsla,
     window: &mut Window,
 ) {
-    // Lines/arrows: a handle at each endpoint (no box — its bbox is degenerate)
+    // Lines/arrows: a handle at each endpoint and one mid-curve to bend it (no
+    // box — its bbox can be degenerate)
     // plus a rotate grip above.
     if let ElementKind::Line(s) | ElementKind::Arrow(s) = kind {
-        for (wx, wy) in [(s.x1, s.y1), (s.x2, s.y2)] {
+        let [bx, by] = s.bend_point();
+        for (wx, wy) in [(s.x1, s.y1), (s.x2, s.y2), (bx, by)] {
             let p = to_screen(wx, wy, cam, origin);
             draw_handle(f32::from(p.x), f32::from(p.y), color, window);
         }
@@ -1589,5 +1689,26 @@ mod tests {
                 assert!((u - v).abs() < px(0.5), "zoom {zoom}: {a:?} vs {b:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod label_contrast_tests {
+    use super::*;
+
+    #[test]
+    fn labels_stay_readable_on_their_fill() {
+        let white = u32_to_hsla(0xF5F5F5FF);
+        let dark = u32_to_hsla(0x1F1F23FF);
+        // White ink on a pastel yellow (a SWOT box in a dark theme): dark text.
+        assert_eq!(readable_on(0xFEF3A0FF, white), Some(0x1F1F23FF));
+        // Dark ink on the same box already reads.
+        assert_eq!(readable_on(0xFEF3A0FF, dark), None);
+        // Dark ink on a navy box: light text.
+        assert_eq!(readable_on(0x1E3A8AFF, dark), Some(0xF5F5F5FF));
+        // A see-through fill leaves the theme ink alone.
+        assert_eq!(readable_on(0xFEF3A022, white), None);
+        // A colored stroke that contrasts is kept.
+        assert_eq!(readable_on(0xFEF3A0FF, u32_to_hsla(0xB91C1CFF)), None);
     }
 }
