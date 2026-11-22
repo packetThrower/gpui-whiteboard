@@ -5164,6 +5164,11 @@ impl WhiteboardView {
                 self.selected.clear();
                 cx.notify();
             }
+            // With nothing selected, Esc puts a drawing tool down and goes back
+            // to Select, like most drawing apps.
+            "escape" if !matches!(self.tool, Tool::Select | Tool::Pan) => {
+                self.set_tool(Tool::Select, cx);
+            }
             _ => return false,
         }
         true
@@ -8478,5 +8483,630 @@ mod input_tests {
             });
             assert_eq!(content.as_deref(), Some("ab\ncd\ne"));
         });
+    }
+}
+
+/// A pass over the board's tools and editing, through GPUI's real input
+/// dispatch: the same mouse and key events a user sends, then the scene read
+/// back.
+#[cfg(test)]
+mod board_tests {
+    use super::*;
+    use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext, point, px, rgba};
+    use std::cell::RefCell;
+
+    fn style() -> WhiteboardStyleFn {
+        Rc::new(|| WhiteboardStyle {
+            bg: rgba(0xF7F7F5FF).into(),
+            grid: rgba(0xCFCFCBFF).into(),
+            text: rgba(0x6B6B66FF).into(),
+            ink: rgba(0x1F1F23FF).into(),
+            panel: rgba(0xFFFFFFFF).into(),
+            panel_strong: rgba(0xFFFFFFFF).into(),
+            accent: rgba(0xE8EEFDFF).into(),
+            selection: rgba(0x2E6BE6FF).into(),
+            swatches: vec![],
+        })
+    }
+
+    /// A focused board in a test window, laid out once.
+    fn board(
+        cx: &mut TestAppContext,
+        read_only: bool,
+    ) -> (Entity<WhiteboardView>, VisualTestContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| {
+                    let v = if read_only {
+                        WhiteboardView::new_read_only(Scene::default(), style(), cx)
+                    } else {
+                        WhiteboardView::new(Scene::default(), style(), cx)
+                    };
+                    v.focus.focus(window, cx);
+                    v
+                })
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let view = window.root(&mut cx).unwrap();
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    fn at(x: f32, y: f32) -> Point<Pixels> {
+        point(px(x), px(y))
+    }
+
+    fn drag(cx: &mut VisualTestContext, from: Point<Pixels>, to: Point<Pixels>) {
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+        let mid = point((from.x + to.x) / 2.0, (from.y + to.y) / 2.0);
+        cx.simulate_mouse_move(mid, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+    }
+
+    fn click(cx: &mut VisualTestContext, p: Point<Pixels>) {
+        cx.simulate_mouse_down(p, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(p, MouseButton::Left, Modifiers::default());
+    }
+
+    fn elements(v: &Entity<WhiteboardView>, cx: &VisualTestContext) -> Vec<Element> {
+        v.read_with(cx, |b, _| b.scene.elements.clone())
+    }
+
+    /// The x, y, w, h of a box shape.
+    fn bbox(e: &Element) -> Option<[f32; 4]> {
+        match &e.kind {
+            ElementKind::Rect(b)
+            | ElementKind::Ellipse(b)
+            | ElementKind::Diamond(b)
+            | ElementKind::Triangle(b)
+            | ElementKind::RoundRect(b)
+            | ElementKind::Star(b)
+            | ElementKind::Hexagon(b) => Some([b.x, b.y, b.w, b.h]),
+            _ => None,
+        }
+    }
+
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 2.0
+    }
+
+    #[gpui::test]
+    fn every_shape_tool_draws_its_shape(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        let tools = ["r", "o", "d", "g", "u", "s", "x"];
+        for (i, key) in tools.iter().enumerate() {
+            cx.simulate_keystrokes(key);
+            let y = 200.0 + i as f32 * 60.0;
+            drag(&mut cx, at(100.0, y), at(200.0, y + 40.0));
+        }
+        let els = elements(&v, &cx);
+        assert_eq!(els.len(), tools.len(), "one shape per drag");
+        let kinds: Vec<&str> = els
+            .iter()
+            .map(|e| match e.kind {
+                ElementKind::Rect(_) => "rect",
+                ElementKind::Ellipse(_) => "ellipse",
+                ElementKind::Diamond(_) => "diamond",
+                ElementKind::Triangle(_) => "triangle",
+                ElementKind::RoundRect(_) => "round",
+                ElementKind::Star(_) => "star",
+                ElementKind::Hexagon(_) => "hexagon",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "rect", "ellipse", "diamond", "triangle", "round", "star", "hexagon"
+            ]
+        );
+        // The box spans the drag, in world units at 100% zoom.
+        let b = bbox(&els[0]).unwrap();
+        assert!(
+            near(b[2], 100.0) && near(b[3], 40.0),
+            "rect is the drag's size: {b:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn lines_arrows_and_pen(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("l");
+        drag(&mut cx, at(100.0, 200.0), at(300.0, 260.0));
+        cx.simulate_keystrokes("a");
+        drag(&mut cx, at(100.0, 300.0), at(300.0, 300.0));
+        cx.simulate_keystrokes("k");
+        drag(&mut cx, at(100.0, 400.0), at(300.0, 400.0));
+        cx.simulate_keystrokes("p");
+        drag(&mut cx, at(100.0, 500.0), at(300.0, 560.0));
+        let els = elements(&v, &cx);
+        assert_eq!(els.len(), 4);
+        match &els[0].kind {
+            ElementKind::Line(s) => {
+                assert!(near(s.x2 - s.x1, 200.0) && near(s.y2 - s.y1, 60.0), "{s:?}")
+            }
+            k => panic!("expected a line, got {k:?}"),
+        }
+        assert!(matches!(&els[1].kind, ElementKind::Arrow(s) if s.style == SegmentStyle::Solid));
+        assert!(matches!(&els[2].kind, ElementKind::Arrow(s) if s.style == SegmentStyle::Dashed));
+        assert!(matches!(&els[3].kind, ElementKind::Draw(st) if st.points.len() >= 2));
+    }
+
+    #[gpui::test]
+    fn select_move_delete_undo_redo(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(200.0, 260.0));
+        let before = bbox(&elements(&v, &cx)[0]).unwrap();
+        // Select it and drag it 50 right, 30 down.
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(150.0, 230.0));
+        assert_eq!(
+            v.read_with(&cx, |b, _| b.selected.len()),
+            1,
+            "click selects"
+        );
+        drag(&mut cx, at(150.0, 230.0), at(200.0, 260.0));
+        let moved = bbox(&elements(&v, &cx)[0]).unwrap();
+        assert!(
+            near(moved[0] - before[0], 50.0) && near(moved[1] - before[1], 30.0),
+            "moved by the drag: {before:?} -> {moved:?}"
+        );
+        // Delete, undo it back, redo it away again.
+        cx.simulate_keystrokes("backspace");
+        assert!(elements(&v, &cx).is_empty(), "delete removes it");
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(elements(&v, &cx).len(), 1, "undo restores it");
+        cx.simulate_keystrokes("ctrl-shift-z");
+        assert!(elements(&v, &cx).is_empty(), "redo removes it again");
+        // Undo twice more: back before the move, then before the shape.
+        cx.simulate_keystrokes("ctrl-z ctrl-z");
+        let undone = bbox(&elements(&v, &cx)[0]).unwrap();
+        assert!(
+            near(undone[0], before[0]) && near(undone[1], before[1]),
+            "move undone"
+        );
+        cx.simulate_keystrokes("ctrl-z");
+        assert!(elements(&v, &cx).is_empty(), "shape undone");
+    }
+
+    #[gpui::test]
+    fn escape_deselects(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(200.0, 260.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(150.0, 230.0));
+        cx.simulate_keystrokes("escape");
+        assert!(v.read_with(&cx, |b, _| b.selected.is_empty()));
+    }
+
+    #[gpui::test]
+    fn text_typing_and_editing_keys(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("t");
+        click(&mut cx, at(200.0, 300.0));
+        cx.simulate_input("hello");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("world");
+        cx.simulate_keystrokes("backspace left");
+        cx.simulate_input("X");
+        cx.simulate_keystrokes("escape");
+        let els = elements(&v, &cx);
+        let text = els.iter().find_map(|e| match &e.kind {
+            ElementKind::Text(t) => Some(t.content.clone()),
+            _ => None,
+        });
+        assert_eq!(text.as_deref(), Some("hello\nworXl"));
+        assert!(
+            v.read_with(&cx, |b, _| b.editing.is_none()),
+            "escape commits"
+        );
+    }
+
+    #[gpui::test]
+    fn text_select_all_and_bold(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("t");
+        click(&mut cx, at(200.0, 300.0));
+        cx.simulate_input("bold me");
+        cx.simulate_keystrokes("ctrl-a ctrl-b escape");
+        let els = elements(&v, &cx);
+        let styles = els.iter().find_map(|e| match &e.kind {
+            ElementKind::Text(_) => Some(e.styles.clone()),
+            _ => None,
+        });
+        let styles = styles.expect("a text element");
+        assert!(
+            styles
+                .iter()
+                .any(|s| s.style.bold && s.start == 0 && s.end == 7),
+            "the whole text is bold: {styles:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn copy_paste_and_z_order(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        let clip: Rc<RefCell<Option<String>>> = Rc::default();
+        v.update(&mut cx, |b, _| {
+            let w = clip.clone();
+            b.set_on_copy(Rc::new(move |json, _, _| *w.borrow_mut() = Some(json)));
+            let r = clip.clone();
+            b.set_on_paste(Rc::new(move |_, _| r.borrow().clone()));
+        });
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(200.0, 260.0));
+        cx.simulate_keystrokes("o");
+        drag(&mut cx, at(400.0, 200.0), at(500.0, 260.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(150.0, 230.0));
+        // Bring the rect (drawn first, so at the back) to the front.
+        cx.simulate_keystrokes("ctrl-shift-]");
+        let els = elements(&v, &cx);
+        assert!(
+            matches!(els.last().unwrap().kind, ElementKind::Rect(_)),
+            "rect now on top"
+        );
+        cx.simulate_keystrokes("ctrl-c");
+        assert!(clip.borrow().is_some(), "copy hands the host JSON");
+        cx.simulate_keystrokes("ctrl-v");
+        let els = elements(&v, &cx);
+        assert_eq!(els.len(), 3, "paste adds a copy");
+        assert_eq!(
+            els.iter()
+                .filter(|e| matches!(e.kind, ElementKind::Rect(_)))
+                .count(),
+            2
+        );
+    }
+
+    #[gpui::test]
+    fn scene_json_round_trip(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        for (key, y) in [("r", 200.0), ("a", 300.0), ("p", 400.0)] {
+            cx.simulate_keystrokes(key);
+            drag(&mut cx, at(100.0, y), at(220.0, y + 40.0));
+        }
+        cx.simulate_keystrokes("t");
+        click(&mut cx, at(400.0, 500.0));
+        cx.simulate_input("note");
+        cx.simulate_keystrokes("escape");
+        let json = v.read_with(&cx, |b, _| b.scene.to_json());
+        let back = Scene::from_json(&json);
+        assert_eq!(back.elements.len(), 4);
+        assert_eq!(back.to_json(), json, "JSON survives a round trip unchanged");
+    }
+
+    #[gpui::test]
+    fn read_only_board_ignores_drawing(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, true);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(200.0, 260.0));
+        assert!(elements(&v, &cx).is_empty());
+        assert_eq!(v.read_with(&cx, |b, _| b.tool), Tool::Pan);
+    }
+
+    #[gpui::test]
+    fn pan_tool_and_ctrl_wheel_zoom_move_the_camera(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("h");
+        drag(&mut cx, at(300.0, 300.0), at(360.0, 340.0));
+        let cam = v.read_with(&cx, |b, _| b.scene.camera);
+        assert!(
+            cam.x != 0.0 || cam.y != 0.0,
+            "panning moved the camera: {cam:?}"
+        );
+        let z0 = cam.zoom;
+        cx.simulate_event(gpui::ScrollEvent {
+            position: at(400.0, 400.0),
+            delta: gpui::ScrollDelta::Lines(point(0.0, 3.0)),
+            modifiers: Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let z1 = v.read_with(&cx, |b, _| b.scene.camera.zoom);
+        assert!(z1 != z0, "ctrl+wheel zooms: {z0} -> {z1}");
+    }
+
+    fn double_click(cx: &mut VisualTestContext, p: Point<Pixels>) {
+        click(cx, p);
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: MouseButton::Left,
+            position: p,
+            modifiers: Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_mouse_up(p, MouseButton::Left, Modifiers::default());
+    }
+
+    fn center(e: &Element) -> Point<Pixels> {
+        let b = bbox(e).expect("a box shape");
+        at(b[0] + b[2] / 2.0, b[1] + b[3] / 2.0)
+    }
+
+    #[gpui::test]
+    fn mind_map_enter_adds_a_sibling_and_tab_a_child(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("m");
+        click(&mut cx, at(600.0, 400.0));
+        let els = elements(&v, &cx);
+        let n0 = els.len();
+        assert!(n0 >= 2, "a seed map: root plus branches ({n0})");
+        let branch = els
+            .iter()
+            .find(|e| e.mindmap.as_ref().is_some_and(|m| m.parent.is_some()))
+            .expect("a branch node")
+            .clone();
+        let parent = branch.mindmap.as_ref().unwrap().parent;
+        double_click(&mut cx, center(&branch));
+        assert_eq!(
+            v.read_with(&cx, |b, _| b.editing),
+            Some(branch.id),
+            "double-click edits"
+        );
+        // Enter the Windows way (no key_char) — the path that once did nothing.
+        cx.simulate_event(KeyDownEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        let nodes = |els: &[Element]| -> Vec<Element> {
+            els.iter()
+                .filter(|e| e.mindmap.is_some())
+                .cloned()
+                .collect()
+        };
+        let n0 = nodes(&els).len();
+        let els = elements(&v, &cx);
+        assert_eq!(nodes(&els).len(), n0 + 1, "Enter adds a node");
+        let sibling = nodes(&els).last().unwrap().clone();
+        assert_eq!(
+            sibling.mindmap.as_ref().unwrap().parent,
+            parent,
+            "a sibling"
+        );
+        // Tab on the new node: a child of it.
+        cx.simulate_event(KeyDownEvent {
+            keystroke: gpui::Keystroke::parse("tab").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        let els = elements(&v, &cx);
+        assert_eq!(nodes(&els).len(), n0 + 2, "Tab adds a node");
+        assert_eq!(
+            nodes(&els).last().unwrap().mindmap.as_ref().unwrap().parent,
+            Some(sibling.id),
+            "a child of the node being edited"
+        );
+    }
+
+    #[gpui::test]
+    fn double_click_reedits_text_and_shape_labels(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("t");
+        click(&mut cx, at(200.0, 300.0));
+        cx.simulate_input("abc");
+        cx.simulate_keystrokes("escape");
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(400.0, 300.0), at(560.0, 380.0));
+        // Edit the text again: caret lands in it, typing appends at the end.
+        cx.simulate_keystrokes("v");
+        double_click(&mut cx, at(205.0, 308.0));
+        assert!(
+            v.read_with(&cx, |b, _| b.editing.is_some()),
+            "text re-enters editing"
+        );
+        cx.simulate_keystrokes("end");
+        cx.simulate_input("d");
+        cx.simulate_keystrokes("escape");
+        // A shape gets a label the same way.
+        double_click(&mut cx, at(480.0, 340.0));
+        cx.simulate_input("box");
+        cx.simulate_keystrokes("escape");
+        let els = elements(&v, &cx);
+        let text = els.iter().find_map(|e| match &e.kind {
+            ElementKind::Text(t) => Some(t.content.clone()),
+            _ => None,
+        });
+        assert_eq!(text.as_deref(), Some("abcd"));
+        let label = els
+            .iter()
+            .find(|e| matches!(e.kind, ElementKind::Rect(_)))
+            .and_then(|e| e.label.clone());
+        assert_eq!(label.as_deref(), Some("box"));
+    }
+
+    #[gpui::test]
+    fn marquee_selects_several_and_moves_them_together(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(200.0, 300.0), at(260.0, 340.0));
+        cx.simulate_keystrokes("o");
+        drag(&mut cx, at(320.0, 300.0), at(380.0, 340.0));
+        cx.simulate_keystrokes("v");
+        drag(&mut cx, at(150.0, 250.0), at(450.0, 400.0));
+        assert_eq!(
+            v.read_with(&cx, |b, _| b.selected.len()),
+            2,
+            "both in the marquee"
+        );
+        let before: Vec<_> = elements(&v, &cx).iter().map(|e| bbox(e).unwrap()).collect();
+        drag(&mut cx, at(230.0, 320.0), at(250.0, 360.0));
+        let after: Vec<_> = elements(&v, &cx).iter().map(|e| bbox(e).unwrap()).collect();
+        for (b, a) in before.iter().zip(&after) {
+            assert!(
+                near(a[0] - b[0], 20.0) && near(a[1] - b[1], 40.0),
+                "{b:?} -> {a:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn dragging_a_corner_resizes(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(200.0, 300.0), at(300.0, 360.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(250.0, 330.0));
+        drag(&mut cx, at(300.0, 360.0), at(340.0, 400.0));
+        let b = bbox(&elements(&v, &cx)[0]).unwrap();
+        assert!(
+            near(b[2], 140.0) && near(b[3], 100.0),
+            "corner drag resized: {b:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn connector_arrow_follows_its_shape(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(200.0, 300.0), at(300.0, 360.0));
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(500.0, 300.0), at(600.0, 360.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(250.0, 330.0));
+        // The first shape's right-hand connector button, from the same layout
+        // the paint uses.
+        let button = v.read_with(&cx, |b, _| {
+            let a = &b.scene.elements[0];
+            let origin = b.bounds.get().origin;
+            crate::paint::connector_button_centers(&a.kind, b.scene.camera, origin)
+                .into_iter()
+                .max_by(|p, q| p.x.partial_cmp(&q.x).unwrap())
+                .unwrap()
+        });
+        cx.simulate_mouse_move(button, None, Modifiers::default());
+        // Release on the second shape's left connector: the end snaps to it.
+        drag(&mut cx, button, at(502.0, 330.0));
+        let els = elements(&v, &cx);
+        let seg = els
+            .iter()
+            .find_map(|e| match &e.kind {
+                ElementKind::Arrow(s) | ElementKind::Line(s) => Some(*s),
+                _ => None,
+            })
+            .expect("a connector was drawn");
+        let (a_id, b_id) = (els[0].id, els[1].id);
+        assert_eq!(
+            seg.start_anchor.map(|x| x.element_id),
+            Some(a_id),
+            "{seg:?}"
+        );
+        assert_eq!(seg.end_anchor.map(|x| x.element_id), Some(b_id), "{seg:?}");
+        // Move the second shape 100 down: the arrow's end goes with it.
+        click(&mut cx, at(550.0, 330.0));
+        drag(&mut cx, at(550.0, 330.0), at(550.0, 430.0));
+        let moved = elements(&v, &cx)
+            .iter()
+            .find_map(|e| match &e.kind {
+                ElementKind::Arrow(s) | ElementKind::Line(s) => Some(*s),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            near(moved.y2 - seg.y2, 100.0),
+            "end followed: {seg:?} -> {moved:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn escape_puts_a_drawing_tool_down(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("t escape");
+        assert_eq!(v.read_with(&cx, |b, _| b.tool), Tool::Select);
+        // Pan (the default navigation tool) stays put.
+        cx.simulate_keystrokes("h escape");
+        assert_eq!(v.read_with(&cx, |b, _| b.tool), Tool::Pan);
+    }
+
+    #[gpui::test]
+    fn flowchart_seed_is_linked_boxes(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("f");
+        click(&mut cx, at(600.0, 400.0));
+        let els = elements(&v, &cx);
+        let boxes = els.iter().filter(|e| bbox(e).is_some()).count();
+        let links: Vec<_> = els
+            .iter()
+            .filter_map(|e| match &e.kind {
+                ElementKind::Arrow(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            boxes >= 2 && !links.is_empty(),
+            "boxes {boxes}, links {}",
+            links.len()
+        );
+        assert!(
+            links
+                .iter()
+                .all(|s| s.start_anchor.is_some() && s.end_anchor.is_some()),
+            "every flowchart arrow is attached at both ends"
+        );
+    }
+
+    #[gpui::test]
+    fn image_and_page_card_tools_ask_the_host(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        type Asked = Rc<RefCell<Vec<(&'static str, f32, f32)>>>;
+        let asked: Asked = Rc::default();
+        v.update(&mut cx, |b, _| {
+            let a = asked.clone();
+            b.set_on_place_image(Rc::new(move |x, y, _, _| {
+                a.borrow_mut().push(("image", x, y))
+            }));
+            let a = asked.clone();
+            b.set_on_place_embed(Rc::new(move |x, y, _, _| {
+                a.borrow_mut().push(("embed", x, y))
+            }));
+        });
+        cx.simulate_keystrokes("i");
+        click(&mut cx, at(300.0, 400.0));
+        v.update(&mut cx, |b, cx| b.set_tool(Tool::Embed, cx));
+        click(&mut cx, at(500.0, 450.0));
+        let asked = asked.borrow().clone();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert_eq!(asked[0].0, "image");
+        assert!(
+            near(asked[0].1, 300.0) && near(asked[0].2, 400.0),
+            "{asked:?}"
+        );
+        assert_eq!(asked[1].0, "embed");
+    }
+
+    #[gpui::test]
+    fn text_formats_toggle(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("t");
+        click(&mut cx, at(200.0, 300.0));
+        cx.simulate_input("styled");
+        cx.simulate_keystrokes("ctrl-a ctrl-i ctrl-u ctrl-shift-x");
+        let style = v.read_with(&cx, |b, _| {
+            b.scene
+                .elements
+                .iter()
+                .find(|e| matches!(e.kind, ElementKind::Text(_)))
+                .and_then(|e| e.styles.first().map(|s| s.style))
+        });
+        let st = style.expect("a styled run");
+        assert!(st.italic && st.underline && st.strike, "{st:?}");
+        // Toggling again clears it.
+        cx.simulate_keystrokes("ctrl-i");
+        let italic = v.read_with(&cx, |b, _| {
+            b.scene
+                .elements
+                .iter()
+                .find(|e| matches!(e.kind, ElementKind::Text(_)))
+                .is_some_and(|e| e.styles.iter().any(|s| s.style.italic))
+        });
+        assert!(!italic, "second ⌘I removes italic");
     }
 }
