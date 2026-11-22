@@ -1081,8 +1081,10 @@ impl WhiteboardView {
         cx: &mut Context<Self>,
     ) {
         if double {
+            // Back to the default: top-center, as a row.
             self.toolbar_drag = None;
             self.toolbar_pos = None;
+            self.toolbar_vertical = false;
             if let Some(f) = self.on_move_toolbar.clone() {
                 f(None, self.toolbar_vertical, window, cx);
             }
@@ -2775,20 +2777,33 @@ impl WhiteboardView {
     /// become the new selection. Shared by template apply and clipboard paste.
     /// No-op for an empty group.
     fn stamp_elements(&mut self, elems: &[Element], window: &mut Window, cx: &mut Context<Self>) {
+        self.stamp_elements_at(elems, None, window, cx);
+    }
+
+    /// [`Self::stamp_elements`], centered on world point `at` when given (a
+    /// right-click Paste lands where you clicked), else in the viewport.
+    fn stamp_elements_at(
+        &mut self,
+        elems: &[Element],
+        at: Option<[f32; 2]>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if elems.is_empty() {
             return;
         }
         self.open_group = None;
         self.push_undo();
-        // Center the (origin-normalized) group in the viewport.
+        // Center the (origin-normalized) group on `at`, or in the viewport.
         let b = self.bounds.get();
         let cam = self.scene.camera;
         let z = cam.zoom.max(MIN_ZOOM);
         let (tw, th) = elements_extent(elems);
-        let off = [
-            cam.x + (f32::from(b.size.width) / 2.0) / z - tw / 2.0,
-            cam.y + (f32::from(b.size.height) / 2.0) / z - th / 2.0,
-        ];
+        let center = at.unwrap_or([
+            cam.x + (f32::from(b.size.width) / 2.0) / z,
+            cam.y + (f32::from(b.size.height) / 2.0) / z,
+        ]);
+        let off = [center[0] - tw / 2.0, center[1] - th / 2.0];
         let mut new_ids = Vec::with_capacity(elems.len());
         for e in elems {
             let mut c = e.clone();
@@ -3445,8 +3460,9 @@ impl WhiteboardView {
         pos: Point<Pixels>,
         source_id: u64,
     ) -> Option<(ConnectPoint, bool)> {
+        // Within this of a shape its nearest connector lights up, and releasing
+        // there binds to it: what's highlighted is what you get.
         const SHOW_DISTANCE_PX: f32 = 64.0;
-        const SNAP_DISTANCE_PX: f32 = 20.0;
         let origin = self.bounds.get().origin;
         let (sx, sy) = (f32::from(pos.x), f32::from(pos.y));
         let world = self.event_to_world(pos);
@@ -3482,12 +3498,7 @@ impl WhiteboardView {
                 )
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(distance_sq, connector)| {
-                (
-                    connector,
-                    distance_sq <= SNAP_DISTANCE_PX * SNAP_DISTANCE_PX,
-                )
-            })
+            .map(|(_, connector)| (connector, true))
     }
 
     fn on_left_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -4079,10 +4090,12 @@ impl WhiteboardView {
             .rev()
             .find(|e| hit_test(&e.kind, p[0], p[1], pad))
             .map(|e| e.id);
-        if let Some(id) = hit
-            && !self.selected.contains(&id)
-        {
-            self.selected = vec![id];
+        match hit {
+            Some(id) if !self.selected.contains(&id) => self.selected = vec![id],
+            Some(_) => {}
+            // Empty canvas: the menu is about the canvas (paste), not whatever
+            // happened to be selected.
+            None => self.selected.clear(),
         }
         // Show the menu when there's a selection (copy / cut / z-order / save) or
         // paste is wired (so you can paste onto empty canvas). Positioned at the click.
@@ -4113,10 +4126,19 @@ impl WhiteboardView {
         }
     }
 
-    /// Context-menu Paste.
+    /// Context-menu Paste: lands centered where the menu was opened.
     fn paste_from_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.context_menu = None;
-        self.try_paste(window, cx);
+        let at = self.context_menu.take().map(|p| {
+            self.scene
+                .camera
+                .screen_to_world(f32::from(p.x), f32::from(p.y))
+        });
+        if let Some(f) = self.on_paste.clone()
+            && let Some(json) = f(window, cx)
+            && let Ok(elems) = serde_json::from_str::<Vec<Element>>(&json)
+        {
+            self.stamp_elements_at(&elems, at.map(|(x, y)| [x, y]), window, cx);
+        }
     }
 
     fn on_middle_down(
@@ -5204,11 +5226,20 @@ impl WhiteboardView {
             cx.notify();
             return;
         }
-        // Escape closes an open color picker or the templates modal (when the
-        // board holds focus).
-        if ev.keystroke.key == "escape" && (self.picker.is_some() || self.templates_open) {
+        // Escape closes an open color picker, tool / thickness / font flyout, or
+        // the templates modal (when the board holds focus).
+        if ev.keystroke.key == "escape"
+            && (self.picker.is_some()
+                || self.templates_open
+                || self.open_group.is_some()
+                || self.width_open
+                || self.font_open)
+        {
             self.picker = None;
             self.templates_open = false;
+            self.open_group = None;
+            self.width_open = false;
+            self.font_open = false;
             cx.notify();
             return;
         }
@@ -9143,5 +9174,69 @@ mod board_tests {
         cx.simulate_mouse_down(at(450.0, 230.0), MouseButton::Right, Modifiers::default());
         cx.simulate_mouse_up(at(450.0, 230.0), MouseButton::Right, Modifiers::default());
         assert_eq!(v.read_with(&cx, |b, _| b.selected.clone()), vec![ellipse]);
+    }
+
+    #[gpui::test]
+    fn right_click_empty_canvas_clears_and_paste_lands_there(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        let clip: Rc<RefCell<Option<String>>> = Rc::default();
+        v.update(&mut cx, |b, _| {
+            let w = clip.clone();
+            b.set_on_copy(Rc::new(move |json, _, _| *w.borrow_mut() = Some(json)));
+            let r = clip.clone();
+            b.set_on_paste(Rc::new(move |_, _| r.borrow().clone()));
+        });
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(100.0, 200.0), at(200.0, 260.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(150.0, 230.0));
+        cx.simulate_keystrokes("ctrl-c");
+        cx.simulate_mouse_down(at(600.0, 500.0), MouseButton::Right, Modifiers::default());
+        cx.simulate_mouse_up(at(600.0, 500.0), MouseButton::Right, Modifiers::default());
+        assert!(
+            v.read_with(&cx, |b, _| b.selected.is_empty()),
+            "empty canvas clears"
+        );
+        v.update_in(&mut cx, |b, window, cx| b.paste_from_menu(window, cx));
+        let pasted = bbox(elements(&v, &cx).last().unwrap()).unwrap();
+        assert!(
+            near(pasted[0] + pasted[2] / 2.0, 600.0) && near(pasted[1] + pasted[3] / 2.0, 500.0),
+            "pasted centered on the right-click: {pasted:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn connector_binds_when_released_inside_the_target(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(200.0, 300.0), at(300.0, 360.0));
+        cx.simulate_keystrokes("r");
+        drag(&mut cx, at(500.0, 300.0), at(600.0, 360.0));
+        cx.simulate_keystrokes("v");
+        click(&mut cx, at(250.0, 330.0));
+        let button = v.read_with(&cx, |b, _| {
+            let a = &b.scene.elements[0];
+            crate::paint::connector_button_centers(&a.kind, b.scene.camera, b.bounds.get().origin)
+                .into_iter()
+                .max_by(|p, q| p.x.partial_cmp(&q.x).unwrap())
+                .unwrap()
+        });
+        cx.simulate_mouse_move(button, None, Modifiers::default());
+        // The middle of the second shape: its nearest connector is lit, so
+        // that's where the arrow binds.
+        drag(&mut cx, button, at(550.0, 330.0));
+        let els = elements(&v, &cx);
+        let seg = els
+            .iter()
+            .find_map(|e| match &e.kind {
+                ElementKind::Arrow(s) => Some(*s),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            seg.end_anchor.map(|a| a.element_id),
+            Some(els[1].id),
+            "{seg:?}"
+        );
     }
 }
