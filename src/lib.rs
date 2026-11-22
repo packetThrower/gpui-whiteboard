@@ -1485,6 +1485,7 @@ impl WhiteboardView {
                     start_anchor: Some(start_anchor),
                     end_anchor: Some(end_anchor),
                     bend: 0.0,
+                    bend_at: 0.5,
                 }),
                 stroke,
                 fill: None,
@@ -1600,6 +1601,7 @@ impl WhiteboardView {
                     start_anchor: Some(start_anchor),
                     end_anchor: Some(end_anchor),
                     bend: 0.0,
+                    bend_at: 0.5,
                 }),
                 stroke,
                 fill: None,
@@ -2230,6 +2232,7 @@ impl WhiteboardView {
                 start_anchor: Some(start_anchor),
                 end_anchor: Some(end_anchor),
                 bend: 0.0,
+                bend_at: 0.5,
             }),
             stroke: Some(0x2563ebff),
             fill: None,
@@ -3995,6 +3998,7 @@ impl WhiteboardView {
                         }),
                         end_anchor: None,
                         bend: 0.0,
+                        bend_at: 0.5,
                     }),
                 });
                 self.connecting = Some(ConnectDrag { from: cp });
@@ -4144,6 +4148,7 @@ impl WhiteboardView {
                 start_anchor: None,
                 end_anchor: None,
                 bend: 0.0,
+                bend_at: 0.5,
             }),
             Tool::Arrow => ElementKind::Arrow(SegGeom {
                 x1: anchor[0],
@@ -4155,6 +4160,7 @@ impl WhiteboardView {
                 start_anchor: None,
                 end_anchor: None,
                 bend: 0.0,
+                bend_at: 0.5,
             }),
             Tool::DashedArrow => ElementKind::Arrow(SegGeom {
                 x1: anchor[0],
@@ -4166,6 +4172,7 @@ impl WhiteboardView {
                 start_anchor: None,
                 end_anchor: None,
                 bend: 0.0,
+                bend_at: 0.5,
             }),
             Tool::CurvedLine => ElementKind::Line(SegGeom {
                 x1: anchor[0],
@@ -4177,6 +4184,7 @@ impl WhiteboardView {
                 start_anchor: None,
                 end_anchor: None,
                 bend: CURVED_TOOL_BEND,
+                bend_at: 0.5,
             }),
             Tool::CurvedArrow => ElementKind::Arrow(SegGeom {
                 x1: anchor[0],
@@ -4188,6 +4196,7 @@ impl WhiteboardView {
                 start_anchor: None,
                 end_anchor: None,
                 bend: CURVED_TOOL_BEND,
+                bend_at: 0.5,
             }),
             Tool::CurvedDashedArrow => ElementKind::Arrow(SegGeom {
                 x1: anchor[0],
@@ -4199,6 +4208,7 @@ impl WhiteboardView {
                 start_anchor: None,
                 end_anchor: None,
                 bend: CURVED_TOOL_BEND,
+                bend_at: 0.5,
             }),
             // These tools don't create a drag-element here (handled earlier).
             Tool::Pan
@@ -4650,12 +4660,17 @@ impl WhiteboardView {
         if let Some(ep) = self.endpoint
             && ep.which == 2
         {
-            // The bend handle: the curve's middle follows the pointer; near
-            // the straight line it snaps straight.
+            // The bend handle: the curve's peak follows the pointer across the
+            // line (near it, it snaps straight); with Shift it also slides
+            // along the line, moving the peak (snapping back to the middle).
             let cur = self.event_to_world(ev.position);
             if let Some(e) = self.scene.elements.iter_mut().find(|e| e.id == ep.id)
                 && let ElementKind::Line(s) | ElementKind::Arrow(s) = &mut e.kind
             {
+                if ev.modifiers.shift {
+                    let at = s.bend_at_toward(cur);
+                    s.bend_at = if (at - 0.5).abs() < 0.03 { 0.5 } else { at };
+                }
                 let bend = s.bend_toward(cur);
                 s.bend = if bend.abs() < 0.03 { 0.0 } else { bend };
             }
@@ -8323,6 +8338,7 @@ mod tests {
                         start_anchor: None,
                         end_anchor: None,
                         bend: 0.0,
+                        bend_at: 0.5,
                     }),
                     stroke: None,
                     fill: None,
@@ -8614,6 +8630,7 @@ mod tests {
             start_anchor: None,
             end_anchor: None,
             bend: 0.0,
+            bend_at: 0.5,
         });
         assert_eq!(bbox(&k), (0.0, 0.0, 10.0, 4.0));
         translate(&mut k, 5.0, -2.0);
@@ -8808,6 +8825,7 @@ mod tests {
             start_anchor: None,
             end_anchor: None,
             bend: 0.0,
+            bend_at: 0.5,
         });
         rotate_element(&mut seg, 0.0, 0.0, FRAC_PI_2);
         match seg {
@@ -9979,8 +9997,27 @@ mod board_tests {
         );
         let mid = s.bend_point();
         assert!((mid[1] - 150.0).abs() < 2.0, "the curve passes the pointer");
+        // With Shift the peak also slides along the line, and the curve
+        // still passes under the pointer.
+        let shift = Modifiers::shift();
+        cx.simulate_mouse_down(at(mid[0], mid[1]), MouseButton::Left, shift);
+        cx.simulate_mouse_move(at(150.0, 160.0), MouseButton::Left, shift);
+        cx.simulate_mouse_move(at(150.0, 150.0), MouseButton::Left, shift);
+        cx.simulate_mouse_up(at(150.0, 150.0), MouseButton::Left, shift);
+        let s = seg(&mut cx, 1);
+        assert!(
+            (s.bend_at - 0.25).abs() < 0.02,
+            "peak a quarter along: {}",
+            s.bend_at
+        );
+        let peak = s.points(24)[6]; // t = 0.25
+        assert!(
+            (peak[0] - 150.0).abs() < 2.0 && (peak[1] - 150.0).abs() < 2.0,
+            "the curve passes the pointer: {peak:?}"
+        );
         // …and snaps back straight near the line.
-        drag(&mut cx, at(mid[0], mid[1]), at(200.0, 202.0));
+        let mid = s.bend_point();
+        drag(&mut cx, at(mid[0], mid[1]), at(150.0, 202.0));
         assert_eq!(seg(&mut cx, 1).bend, 0.0);
         // Exports draw it as a curve.
         let svg = v.read_with(&cx, |b, _| {

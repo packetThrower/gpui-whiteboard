@@ -63,7 +63,8 @@ There are two layers:
   typing from the top-left; long text wraps and shrinks to fit.
 - **Curved lines.** Curved line / arrow / dashed-arrow tools in the Lines
   flyout, and every selected line or arrow has a handle at its middle: drag it
-  to bend the line, or back onto the line to straighten it. Bound arrows keep
+  to bend the line, or back onto the line to straighten it; hold Shift to
+  also slide the curve's peak along the line. Bound arrows keep
   their curve as their shapes move.
 - **Bullets and checklists.** In any text — text boxes, shape labels, sticky
   notes — `* ` or `- ` at the start of a line becomes `• `, and `[ ] ` becomes a
@@ -488,7 +489,7 @@ The view handles these when it has focus (it focuses on a canvas click):
 | scroll · pinch | zoom |
 | hold `⌥` while dragging | snap to the grid |
 | click / shift-click / marquee-drag (Select tool) | select one / add / box-select (a grouped element brings its whole group) |
-| drag a line's middle handle | bend it (drag back onto the line to straighten) |
+| drag a line's middle handle | bend it (drag back onto the line to straighten); with `⇧`, also slide the peak along the line |
 | drag a handle · the round grip above a selection | resize (corners scale; edge handles stretch one axis, on a single element or a group) · rotate |
 | double-click a page-card | open its page (via `OpenPageFn`) |
 | double-click text · `T`-click text | edit it — click a letter for the caret, drag / double-click to select |

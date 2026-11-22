@@ -480,42 +480,79 @@ pub struct SegGeom {
     /// Absent in older boards.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub bend: f32,
+    /// Where along the line the curve peaks, as a fraction of the way from
+    /// (x1, y1) to (x2, y2): 0.5 (the default) is symmetric. Kept within
+    /// 0.1–0.9. Absent in older boards.
+    #[serde(default = "half", skip_serializing_if = "is_half")]
+    pub bend_at: f32,
 }
 
 fn is_zero(v: &f32) -> bool {
     *v == 0.0
 }
 
+fn half() -> f32 {
+    0.5
+}
+
+fn is_half(v: &f32) -> bool {
+    *v == 0.5
+}
+
 impl SegGeom {
-    /// The quadratic Bézier control point of a bent segment; `None` when
-    /// straight.
+    /// The quadratic Bézier control point of a bent segment, chosen so the
+    /// curve passes through [`bend_point`](Self::bend_point) at `t = bend_at`;
+    /// `None` when straight.
     pub fn control(&self) -> Option<[f32; 2]> {
         (self.bend != 0.0).then(|| {
-            let [x, y] = self.bend_point();
-            let (mx, my) = ((self.x1 + self.x2) / 2.0, (self.y1 + self.y2) / 2.0);
-            [2.0 * x - mx, 2.0 * y - my]
+            let [px, py] = self.bend_point();
+            let a = self.bend_at();
+            let (u, k) = ((1.0 - a) * (1.0 - a), 2.0 * a * (1.0 - a));
+            [
+                (px - u * self.x1 - a * a * self.x2) / k,
+                (py - u * self.y1 - a * a * self.y2) / k,
+            ]
         })
     }
 
-    /// The middle of the curve (the chord's middle when straight) — where the
-    /// bend handle sits.
+    /// `bend_at`, kept clear of the ends (where the curve would blow up).
+    fn bend_at(&self) -> f32 {
+        self.bend_at.clamp(0.1, 0.9)
+    }
+
+    /// The curve's peak — `bend_at` of the way along the line, `bend × length`
+    /// off it — where the bend handle sits (on the line when straight).
     pub fn bend_point(&self) -> [f32; 2] {
         let (dx, dy) = (self.x2 - self.x1, self.y2 - self.y1);
+        let a = self.bend_at();
         [
-            (self.x1 + self.x2) / 2.0 - dy * self.bend,
-            (self.y1 + self.y2) / 2.0 + dx * self.bend,
+            self.x1 + dx * a - dy * self.bend,
+            self.y1 + dy * a + dx * self.bend,
         ]
     }
 
-    /// The `bend` that puts the curve's middle nearest world point `p`.
+    /// The `bend` that puts the curve's peak nearest world point `p`, keeping
+    /// where along the line it sits.
     pub fn bend_toward(&self, p: [f32; 2]) -> f32 {
         let (dx, dy) = (self.x2 - self.x1, self.y2 - self.y1);
         let len2 = dx * dx + dy * dy;
         if len2 < 1e-6 {
             return 0.0;
         }
-        let (mx, my) = ((self.x1 + self.x2) / 2.0, (self.y1 + self.y2) / 2.0);
+        let a = self.bend_at();
+        let (mx, my) = (self.x1 + dx * a, self.y1 + dy * a);
         ((p[0] - mx) * -dy + (p[1] - my) * dx) / len2
+    }
+
+    /// The `bend_at` that slides the curve's peak along the line toward world
+    /// point `p` (clamped to 0.1–0.9).
+    pub fn bend_at_toward(&self, p: [f32; 2]) -> f32 {
+        let (dx, dy) = (self.x2 - self.x1, self.y2 - self.y1);
+        let len2 = dx * dx + dy * dy;
+        if len2 < 1e-6 {
+            return 0.5;
+        }
+        (((p[0] - self.x1) * dx + (p[1] - self.y1) * dy) / len2).clamp(0.1, 0.9)
     }
 
     /// `n + 1` points along the line, ends included.
