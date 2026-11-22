@@ -5707,7 +5707,11 @@ impl Render for WhiteboardView {
             // Disjoint field borrows (vs `&mut e.kind` below) so the text arms can
             // read the label, its color, and the styling without cloning.
             let label = e.label.as_deref();
-            let label_color = e.label_color;
+            // Same rule as `paint::thumbnail_text_outline`'s caller: a label
+            // without its own color reads on the shape's fill.
+            let label_color = e
+                .label_color
+                .or_else(|| e.fill.and_then(|f| crate::paint::readable_on(f, stroke)));
             let styles = e.styles.as_slice();
             match &mut e.kind {
                 // Page-card: a titled box (top-aligned header + hint) that links
