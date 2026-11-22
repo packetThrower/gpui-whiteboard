@@ -3855,6 +3855,9 @@ impl WhiteboardView {
         }
 
         if self.tool == Tool::Sticky {
+            // One note per click, then back to Select (like Text in most
+            // boards) so a stray click doesn't drop another.
+            self.tool = Tool::Select;
             self.add_sticky(p, window, cx);
             return;
         }
@@ -5402,15 +5405,18 @@ impl WhiteboardView {
             cx.notify();
             return;
         }
-        // Escape closes an open color picker, tool / thickness / font flyout, or
-        // the templates modal (when the board holds focus).
+        // Escape closes an open context menu, color picker, tool / thickness /
+        // font flyout, or the templates modal (when the board holds focus) —
+        // and nothing else, so the selection a menu acts on survives.
         if ev.keystroke.key == "escape"
-            && (self.picker.is_some()
+            && (self.context_menu.is_some()
+                || self.picker.is_some()
                 || self.templates_open
                 || self.open_group.is_some()
                 || self.width_open
                 || self.font_open)
         {
+            self.context_menu = None;
             self.picker = None;
             self.templates_open = false;
             self.open_group = None;
@@ -9390,6 +9396,11 @@ mod board_tests {
         cx.simulate_mouse_down(at(450.0, 230.0), MouseButton::Right, Modifiers::default());
         cx.simulate_mouse_up(at(450.0, 230.0), MouseButton::Right, Modifiers::default());
         assert_eq!(v.read_with(&cx, |b, _| b.selected.clone()), vec![ellipse]);
+        // Esc closes the menu and nothing else: the selection stays, so the
+        // menu doesn't turn into the empty-canvas one.
+        cx.simulate_keystrokes("escape");
+        assert!(v.read_with(&cx, |b, _| b.context_menu.is_none()));
+        assert_eq!(v.read_with(&cx, |b, _| b.selected.clone()), vec![ellipse]);
     }
 
     #[gpui::test]
@@ -9574,6 +9585,11 @@ mod board_tests {
         );
         assert_eq!(els[0].label.as_deref(), Some("call the plumber"));
         assert!(els[0].fill.is_some(), "a filled note");
+        // One note per click: the tool goes back to Select.
+        assert_eq!(v.read_with(&cx, |b, _| b.tool()), Tool::Select);
+        cx.simulate_keystrokes("escape");
+        click(&mut cx, at(700.0, 400.0));
+        assert_eq!(elements(&v, &cx).len(), 1);
     }
 
     #[gpui::test]
