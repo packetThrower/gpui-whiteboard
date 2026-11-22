@@ -3769,6 +3769,19 @@ impl WhiteboardView {
         let p = self.event_to_world(ev.position);
         let zoom = self.scene.camera.zoom.max(MIN_ZOOM);
 
+        // A click on a checklist box ticks it, with any tool, editing or not.
+        if ev.click_count == 1
+            && !ev.modifiers.shift
+            && !ev.modifiers.alt
+            && let Some((id, at)) = self.checkbox_at(p)
+        {
+            if self.editing.is_some_and(|e| e != id) {
+                self.commit_text(window, cx);
+            }
+            self.toggle_checkbox(id, at, window, cx);
+            return;
+        }
+
         // A press inside the text being edited drives its caret / selection (no
         // commit). A press anywhere else commits the edit, then falls through.
         if let Some(id) = self.editing {
@@ -4763,6 +4776,60 @@ impl WhiteboardView {
     /// hit-testing need. `wrap` is `None` for free text, `Some(inner_width)` for a
     /// label (which word-wraps inside its shape). `x`/`y`/`w`/`h`/`rotation` place
     /// the laid-out block in the world.
+    /// The checklist box under world point `p`: the element and the byte
+    /// offset of its `☐` / `☑`. Topmost element first.
+    fn checkbox_at(&self, p: [f32; 2]) -> Option<(u64, usize)> {
+        let has_box = |t: &str| t.contains(['☐', '☑']);
+        self.scene.elements.iter().rev().find_map(|e| {
+            let text = match &e.kind {
+                ElementKind::Text(t) => Some(t.content.as_str()),
+                _ => e.label.as_deref(),
+            };
+            if !text.is_some_and(has_box) {
+                return None; // skip the layout work for the many without one
+            }
+            let tg = self.edit_target(e.id)?;
+            let (lx, ly) = rotate_pt(p[0], p[1], tg.pivot[0], tg.pivot[1], -tg.rotation);
+            let (lx, ly) = (lx - tg.x, ly - tg.y);
+            let lh = self.font.measure("", tg.size).1;
+            list_marker_starts(&tg.content)
+                .filter(|&(_, m)| m != BULLET)
+                .find_map(|(at, _)| {
+                    let a = self
+                        .font
+                        .caret_pos_wrapped(&tg.content, tg.size, tg.wrap, at);
+                    let b = self
+                        .font
+                        .caret_pos_wrapped(&tg.content, tg.size, tg.wrap, at + 3);
+                    let slop = tg.size * 0.15;
+                    (lx >= a[0] - slop && lx <= b[0] + slop && ly >= a[1] && ly <= a[1] + lh)
+                        .then_some((e.id, at))
+                })
+        })
+    }
+
+    /// Tick or untick the box at byte `at` of element `id` (`☐` ↔ `☑`, the
+    /// same length, so styles and the caret stay put).
+    fn toggle_checkbox(&mut self, id: u64, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.push_undo();
+        let Some(el) = self.scene.elements.iter_mut().find(|e| e.id == id) else {
+            return;
+        };
+        let text = match &mut el.kind {
+            ElementKind::Text(t) => &mut t.content,
+            _ => el.label.get_or_insert_with(String::new),
+        };
+        let flipped = if text[at..].starts_with(TODO) {
+            "☑"
+        } else {
+            "☐"
+        };
+        text.replace_range(at..at + 3, flipped);
+        self.dirty = true;
+        cx.notify();
+        self.flush(window, cx);
+    }
+
     fn edit_target(&self, id: u64) -> Option<EditTarget> {
         let e = self.scene.elements.iter().find(|e| e.id == id)?;
         match &e.kind {
@@ -4913,6 +4980,15 @@ impl WhiteboardView {
         };
         let insert_start = visible_range.start;
         self.replace_range(id, visible_range.start, visible_range.end, new_text, cx);
+        // `* ` / `- ` / `[ ] ` typed at a line's start become a list marker.
+        if new_text == " "
+            && !mark_inserted_text
+            && let Some(text) = self.editing_content()
+            && let Some((start, marker)) = list_shorthand(&text, self.caret)
+        {
+            self.replace_range(id, start, self.caret, marker, cx);
+            return;
+        }
 
         self.marked_range = if mark_inserted_text && !new_text.is_empty() {
             Some(insert_start..insert_start + new_text.len())
@@ -5204,7 +5280,11 @@ impl WhiteboardView {
                     self.replace_range(id, self.caret, caret_right(&content, self.caret), "", cx);
                 }
             }
-            "enter" => self.replace_selection(id, "\n", cx),
+            "enter" => {
+                let (s, e) = self.sel_range();
+                let (s, e, ins) = list_enter(&content, s, e);
+                self.replace_range(id, s, e, &ins, cx);
+            }
             "tab" => cx.propagate(),
             _ => {
                 // Printable text is handled by GPUI's ElementInputHandler path.
@@ -5689,6 +5769,62 @@ fn glyph_style(s: RunStyle) -> font::GlyphStyle {
 /// auto-shrunk font size, the wrap width, and the block's world placement,
 /// centered. Shared by the paint path and the editor so the caret matches the
 /// rendered glyphs exactly.
+/// Whiteboard list markers: stored as plain characters (so search, export
+/// and copy keep them) at the start of a line, each followed by a space.
+const BULLET: &str = "• ";
+const TODO: &str = "☐ ";
+const DONE: &str = "☑ ";
+
+/// Each line of `text` that starts with a list marker: its byte offset and
+/// the marker.
+fn list_marker_starts(text: &str) -> impl Iterator<Item = (usize, &'static str)> + '_ {
+    std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .filter_map(|at| {
+            [BULLET, TODO, DONE]
+                .into_iter()
+                .find(|m| text[at..].starts_with(m))
+                .map(|m| (at, m))
+        })
+}
+
+/// After a space typed so the caret is at `caret`: when the line so far is a
+/// list shorthand — `*` / `-` for a bullet, `[ ]` / `[]` (optionally after a
+/// bullet) for a checkbox, `[x]` for a ticked one — the start of the line and
+/// the marker to put there.
+fn list_shorthand(text: &str, caret: usize) -> Option<(usize, &'static str)> {
+    let start = text[..caret].rfind('\n').map_or(0, |i| i + 1);
+    let typed = &text[start..caret];
+    let typed = typed.strip_prefix(BULLET).unwrap_or(typed);
+    let marker = match typed {
+        "* " | "- " => BULLET,
+        "[ ] " | "[] " => TODO,
+        "[x] " | "[X] " => DONE,
+        _ => return None,
+    };
+    Some((start, marker))
+}
+
+/// What Enter does over `[s, e)` in `text`: inside a list item, a new line
+/// with the next marker (an unticked box after a checkbox); on an empty
+/// item, end the list by removing its marker. Returns the range to replace
+/// and the text to put there.
+fn list_enter(text: &str, s: usize, e: usize) -> (usize, usize, String) {
+    let start = text[..s].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[e..].find('\n').map_or(text.len(), |i| e + i);
+    let Some(marker) = [BULLET, TODO, DONE]
+        .into_iter()
+        .find(|m| text[start..].starts_with(m))
+    else {
+        return (s, e, "\n".into());
+    };
+    if text[start..end].trim_end() == marker.trim_end() {
+        return (start, end, String::new());
+    }
+    let next = if marker == BULLET { BULLET } else { TODO };
+    (s, e, format!("\n{next}"))
+}
+
 /// The label as painted: verbatim while it's being edited — the caret math
 /// runs on the raw string, so a just-typed trailing space or newline must
 /// keep its place — and trimmed otherwise.
@@ -8139,6 +8275,33 @@ mod tests {
     }
 
     #[test]
+    fn list_shorthands_enter_and_markers() {
+        assert_eq!(list_shorthand("* ", 2), Some((0, BULLET)));
+        assert_eq!(list_shorthand("ab\n- ", 5), Some((3, BULLET)));
+        assert_eq!(list_shorthand("[ ] ", 4), Some((0, TODO)));
+        assert_eq!(list_shorthand("• [] ", "• [] ".len()), Some((0, TODO)));
+        assert_eq!(list_shorthand("[x] ", 4), Some((0, DONE)));
+        assert_eq!(list_shorthand("a * ", 4), None, "only at a line's start");
+        // Enter continues a list; a ticked box continues with an empty one.
+        let t = "☑ milk";
+        assert_eq!(
+            list_enter(t, t.len(), t.len()),
+            (t.len(), t.len(), "\n☐ ".into())
+        );
+        let t = "• a";
+        assert_eq!(list_enter(t, t.len(), t.len()).2, "\n• ");
+        // Enter on an empty item ends the list.
+        let t = "• a\n• ";
+        assert_eq!(
+            list_enter(t, t.len(), t.len()),
+            ("• a\n".len(), t.len(), String::new())
+        );
+        assert_eq!(list_enter("plain", 5, 5).2, "\n");
+        let found: Vec<_> = list_marker_starts("☐ a\nb\n☑ c").collect();
+        assert_eq!(found, vec![(0, TODO), ("☐ a\nb\n".len(), DONE)]);
+    }
+
+    #[test]
     fn label_caret_moves_on_trailing_space_and_newline() {
         let font = Font::default();
         let caret = |label: &str| {
@@ -9676,6 +9839,28 @@ mod board_tests {
         cx.simulate_keystrokes("escape");
         click(&mut cx, at(700.0, 400.0));
         assert_eq!(elements(&v, &cx).len(), 1);
+    }
+
+    #[gpui::test]
+    fn checklist_types_continues_and_ticks(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("t");
+        click(&mut cx, at(300.0, 300.0));
+        cx.simulate_input("[ ] milk");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("eggs");
+        cx.simulate_keystrokes("enter enter");
+        cx.simulate_input("* tea");
+        cx.simulate_keystrokes("escape");
+        let text = |cx: &mut VisualTestContext| match &elements(&v, cx)[0].kind {
+            ElementKind::Text(t) => (t.content.clone(), t.x, t.y),
+            _ => panic!("a text element"),
+        };
+        let (content, x, y) = text(&mut cx);
+        assert_eq!(content, "☐ milk\n☐ eggs\n• tea");
+        // Clicking the first box ticks it.
+        click(&mut cx, at(x + 4.0, y + 6.0));
+        assert_eq!(text(&mut cx).0, "☑ milk\n☐ eggs\n• tea");
     }
 
     #[gpui::test]

@@ -61,6 +61,11 @@ There are two layers:
 - **Sticky notes.** `N` drops a paper note with a folded corner and a soft shadow
   (yellow, pink, blue, green or orange, picked from a swatch row) and starts
   typing from the top-left; long text wraps and shrinks to fit.
+- **Bullets and checklists.** In any text — text boxes, shape labels, sticky
+  notes — `* ` or `- ` at the start of a line becomes `• `, and `[ ] ` becomes a
+  `☐` box (`[x] ` a ticked `☑`). Enter continues the list, Enter on an empty
+  item ends it, and clicking a box ticks it. The marks are plain characters,
+  so they survive search, copy and export.
 - **Export.** `Scene::to_drawing` turns a board into vector paths the host can
   save as SVG (`Drawing::to_svg`) or rasterize to PNG.
 - **Theme-reactive.** Colors come from a `Fn() -> WhiteboardStyle` closure read at
@@ -470,6 +475,8 @@ The view handles these when it has focus (it focuses on a canvas click):
 | `⌘Z` / `⌘⇧Z` | undo / redo |
 | `⌘C` / `⌘X` / `⌘V` | copy / cut / paste the selection |
 | `⌘D` · ⌥-drag | duplicate the selection |
+| `* ` / `- ` / `[ ] ` at a line's start (editing text) | bullet / checkbox; Enter continues the list, Enter on an empty item ends it |
+| click a `☐` / `☑` | tick / untick it |
 | `⌘G` / `⌘⇧G` | group / ungroup the selection |
 | `⌘]` / `⌘[` | bring forward / send backward (add `⇧` for to-front / to-back) |
 | `Esc` | deselect (or close the color picker / templates modal) |
