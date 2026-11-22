@@ -59,7 +59,7 @@ world-space `f32` (see [`Camera`](#camera)).
 | [`FontPick`](#fontpick) | enum | `Upload \| Default` | Which face the Font flyout offers |
 | [`Template`](#template) | struct | `{ id, name, elements }` | A reusable, stampable element group |
 | [`Template::from_json`](#templatefrom_json) | assoc fn | `fn from_json(id: i64, name: impl Into<String>, elements_json: &str) -> Self` | Build from the host's stored row |
-| [`WhiteboardView`](#whiteboardview) | struct | `impl Render` | The board entity: canvas + entire editing UI |
+| [`WhiteboardView`](#whiteboardview) | struct | `impl Render + Focusable` | The board entity: canvas + entire editing UI |
 | [`WhiteboardView::new`](#whiteboardviewnew) | constructor | `fn new(scene, style, cx) -> Self` | Build a view over a scene |
 | [`WhiteboardView::set_on_change`](#whiteboardviewset_on_change) | method | `fn set_on_change(&mut self, f: ChangeFn)` | Install the persistence hook |
 | [`WhiteboardView::set_on_place_embed`](#whiteboardviewset_on_place_embed) | method | `fn set_on_place_embed(&mut self, f: PlaceEmbedFn)` | Install the page-card placement hook |
@@ -1054,7 +1054,11 @@ Build a template from the host's stored row.
 pub struct WhiteboardView { /* private */ }
 
 impl Render for WhiteboardView { /* the board + its entire editing UI */ }
+impl Focusable for WhiteboardView { /* the board's own focus handle */ }
 ```
+
+Focus the board (`view.focus_handle(cx).focus(window, cx)`) when the host
+opens it, so tool keys (`T`, `R`, …) and undo reach it without a click first.
 
 The whiteboard entity. It owns the scene, the active tool, selection,
 in-progress edits, undo/redo history, and renders the whole editing UI —
