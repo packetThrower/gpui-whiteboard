@@ -245,6 +245,27 @@ fn element_items(scene: &Scene, e: &Element, font: &Font, ink: u32) -> Vec<DrawI
         ElementKind::Triangle(b) => out.push(shape(unit_polygon(b, &TRIANGLE_UNIT), b)),
         ElementKind::Star(b) => out.push(shape(unit_polygon(b, &star_unit()), b)),
         ElementKind::Hexagon(b) => out.push(shape(unit_polygon(b, &hexagon_unit()), b)),
+        ElementKind::Sticky(b) => {
+            let (body, flap) = crate::paint::sticky_parts(b);
+            let paper = e.fill.unwrap_or(crate::paint::STICKY_COLORS[0]);
+            let flap_color = hsla_to_u32(crate::paint::sticky_flap(u32_to_hsla(paper)));
+            let transform = rotation(b.rotation, b.x + b.w / 2.0, b.y + b.h / 2.0);
+            let side = b.w.abs().min(b.h.abs());
+            out.push(DrawItem::Path {
+                segs: polygon(body.map(|[x, y]| [x + side * 0.01, y + side * 0.025])),
+                fill: Some(0x00000024),
+                stroke: None,
+                transform,
+            });
+            for (pts, color) in [(polygon(body), paper), (polygon(flap), flap_color)] {
+                out.push(DrawItem::Path {
+                    segs: pts,
+                    fill: Some(color),
+                    stroke: None,
+                    transform,
+                });
+            }
+        }
         ElementKind::Line(s) | ElementKind::Arrow(s) => {
             let style = mindmap_style(scene, s);
             out.extend(segment(

@@ -793,6 +793,8 @@ pub struct WhiteboardView {
     picker: Option<Picker>,
     /// The tool category whose flyout is open, if any.
     open_group: Option<ToolGroup>,
+    /// The paper the Sticky tool places (one of `STICKY_COLORS`).
+    sticky_color: u32,
     /// Whether the thickness-preset flyout is open.
     width_open: bool,
     /// Whether the font flyout (upload / default) is open.
@@ -917,6 +919,7 @@ impl WhiteboardView {
             active_width: NIB,
             picker: None,
             open_group: None,
+            sticky_color: crate::paint::STICKY_COLORS[0],
             width_open: false,
             font_open: false,
             templates_open: false,
@@ -2818,7 +2821,7 @@ impl WhiteboardView {
         self.next_id += 1;
         self.scene.elements.push(Element {
             id,
-            kind: ElementKind::Rect(BoxGeom {
+            kind: ElementKind::Sticky(BoxGeom {
                 x: p[0] - side / 2.0,
                 y: p[1] - side / 2.0,
                 w: side,
@@ -2826,8 +2829,8 @@ impl WhiteboardView {
                 width: NIB / self.scene.camera.zoom.max(MIN_ZOOM),
                 rotation: 0.0,
             }),
-            stroke: Some(0xE2CC5AFF),
-            fill: Some(0xFEF3A0FF),
+            stroke: None,
+            fill: Some(self.sticky_color),
             label: None,
             label_color: None,
             styles: Vec::new(),
@@ -4693,7 +4696,8 @@ impl WhiteboardView {
                 | ElementKind::Triangle(b)
                 | ElementKind::RoundRect(b)
                 | ElementKind::Star(b)
-                | ElementKind::Hexagon(b) => {
+                | ElementKind::Hexagon(b)
+                | ElementKind::Sticky(b) => {
                     b.x = anchor[0].min(c[0]);
                     b.y = anchor[1].min(c[1]);
                     b.w = (c[0] - anchor[0]).abs();
@@ -5685,6 +5689,16 @@ fn glyph_style(s: RunStyle) -> font::GlyphStyle {
 /// auto-shrunk font size, the wrap width, and the block's world placement,
 /// centered. Shared by the paint path and the editor so the caret matches the
 /// rendered glyphs exactly.
+/// The label as painted: verbatim while it's being edited — the caret math
+/// runs on the raw string, so a just-typed trailing space or newline must
+/// keep its place — and trimmed otherwise.
+fn label_text(label: Option<&str>, editing: bool) -> &str {
+    match label {
+        Some(l) if editing => l,
+        l => l.map_or("", str::trim),
+    }
+}
+
 fn shape_label_block(
     font: &Font,
     kind: &ElementKind,
@@ -5714,6 +5728,19 @@ fn shape_label_block(
     };
     let wrap = (bw * wf - 2.0 * LABEL_PAD).max(1.0);
     let ih = (bh * hf - 2.0 * LABEL_PAD).max(1.0);
+    // A sticky note writes from the top-left like a pad, clear of its fold.
+    if matches!(kind, ElementKind::Sticky(_)) {
+        let pad = LABEL_PAD.max(bw.min(bh) * 0.08);
+        let wrap = (bw - 2.0 * pad).max(1.0);
+        let ih = (bh - 2.0 * pad - bw.min(bh) * 0.08).max(1.0);
+        let size = font.fit_size(label, wrap, ih, TEXT_SIZE);
+        return LabelBlock {
+            x: bx + pad,
+            y: by + pad,
+            size,
+            wrap,
+        };
+    }
     let size = font.fit_size(label, wrap, ih, TEXT_SIZE);
     let (w, h) = font.measure_wrapped(label, size, Some(wrap));
     // Always horizontally centered; the triangle's band sits on the base, every
@@ -6070,7 +6097,7 @@ impl Render for WhiteboardView {
                         // Built while editing even when empty, so the caret shows the
                         // moment you double-click (before the first keystroke).
                         let active = editing == Some(id);
-                        let text = label.map_or("", str::trim);
+                        let text = label_text(label, active);
                         let label_layout = cached_label_layout(
                             label_layout_cache,
                             &font,
@@ -6827,6 +6854,39 @@ impl Render for WhiteboardView {
                 }
                 popover_anchor().child(row)
             });
+
+        // While the Sticky tool is armed: a row of paper colors for the next note.
+        let sticky_flyout = (self.tool == Tool::Sticky && open_group.is_none()).then(|| {
+            let mut row = div()
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .p(px(5.0))
+                .rounded(px(9.0))
+                .bg(panel_strong)
+                .shadow_lg()
+                .occlude();
+            for (i, c) in crate::paint::STICKY_COLORS.into_iter().enumerate() {
+                let mut swatch = div()
+                    .id(("wb-sticky-color", i))
+                    .size(px(22.0))
+                    .rounded(px(5.0))
+                    .bg(u32_to_hsla(c))
+                    .border_2()
+                    .border_color(if c == self.sticky_color {
+                        accent
+                    } else {
+                        gpui::transparent_black()
+                    });
+                swatch = swatch.on_click(cx.listener(move |this, _ev, window, cx| {
+                    this.focus.focus(window, cx);
+                    this.sticky_color = c;
+                    cx.notify();
+                }));
+                row = row.child(swatch);
+            }
+            popover_anchor().child(row)
+        });
 
         // The toolbar's text-formatting fly-out (the same panel as the right-click
         // submenu), shown while the "Format" button is toggled on during a text edit.
@@ -7743,6 +7803,7 @@ impl Render for WhiteboardView {
             .child(chrome_layer)
             .child(toolbar)
             .children(flyout)
+            .children(sticky_flyout)
             .children(format_panel)
             .children(width_flyout)
             .children(font_flyout)
@@ -8075,6 +8136,23 @@ mod tests {
         let back: Element = serde_json::from_str(old).unwrap();
         assert_eq!(back.label, None);
         assert!(!serde_json::to_string(&back).unwrap().contains("label"));
+    }
+
+    #[test]
+    fn label_caret_moves_on_trailing_space_and_newline() {
+        let font = Font::default();
+        let caret = |label: &str| {
+            let text = label_text(Some(label), true);
+            font.caret_pos_wrapped(text, 16.0, Some(200.0), label.len())
+        };
+        let typed = caret("ab");
+        assert!(caret("ab ")[0] > typed[0], "space moves the caret right");
+        let enter = caret("ab\n");
+        assert!(
+            enter[1] > typed[1] && enter[0] < typed[0],
+            "Enter starts a new line"
+        );
+        assert_eq!(label_text(Some(" ab \n"), false), "ab");
     }
 
     #[test]
@@ -8837,7 +8915,8 @@ mod board_tests {
             | ElementKind::Triangle(b)
             | ElementKind::RoundRect(b)
             | ElementKind::Star(b)
-            | ElementKind::Hexagon(b) => Some([b.x, b.y, b.w, b.h]),
+            | ElementKind::Hexagon(b)
+            | ElementKind::Sticky(b) => Some([b.x, b.y, b.w, b.h]),
             _ => None,
         }
     }
@@ -9584,7 +9663,14 @@ mod board_tests {
             "a square on the click: {b:?}"
         );
         assert_eq!(els[0].label.as_deref(), Some("call the plumber"));
+        assert!(
+            matches!(els[0].kind, ElementKind::Sticky(_)),
+            "a sticky, not a rect"
+        );
         assert!(els[0].fill.is_some(), "a filled note");
+        // Its text starts top-left, not centered.
+        let blk = shape_label_block(&Font::default(), &els[0].kind, b[0], b[1], b[2], b[3], "hi");
+        assert!(blk.x - b[0] < b[2] * 0.15 && blk.y - b[1] < b[3] * 0.15);
         // One note per click: the tool goes back to Select.
         assert_eq!(v.read_with(&cx, |b, _| b.tool()), Tool::Select);
         cx.simulate_keystrokes("escape");

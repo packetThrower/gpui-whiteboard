@@ -58,8 +58,9 @@ There are two layers:
 - **Duplicate and group.** `⌘D` or ⌥-drag copies the selection (arrows between
   copied shapes stay attached to the copies); `⌘G` / `⌘⇧G` group and ungroup, so
   a group selects, moves and copies as one.
-- **Sticky notes.** `N` drops a pale yellow note and starts typing; the text wraps
-  and shrinks to fit.
+- **Sticky notes.** `N` drops a paper note with a folded corner and a soft shadow
+  (yellow, pink, blue, green or orange, picked from a swatch row) and starts
+  typing from the top-left; long text wraps and shrinks to fit.
 - **Export.** `Scene::to_drawing` turns a board into vector paths the host can
   save as SVG (`Drawing::to_svg`) or rasterize to PNG.
 - **Theme-reactive.** Colors come from a `Fn() -> WhiteboardStyle` closure read at
@@ -395,7 +396,7 @@ pub enum ElementKind {       // serialized snake_case: {"rect": {...}}, {"image"
     Draw(Stroke),                                        // freehand pen
     Rect(BoxGeom), Ellipse(BoxGeom), Diamond(BoxGeom),   // box-like shapes
     Triangle(BoxGeom), RoundRect(BoxGeom),
-    Star(BoxGeom), Hexagon(BoxGeom),
+    Star(BoxGeom), Hexagon(BoxGeom), Sticky(BoxGeom),
     Line(SegGeom), Arrow(SegGeom),
     Text(TextGeom),
     Embed(EmbedGeom),                                    // page-card

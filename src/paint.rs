@@ -837,6 +837,7 @@ pub(crate) fn paint_element(
         ElementKind::Hexagon(b) => {
             paint_box_polygon(b, &hexagon_unit(), cam, origin, ink, fill, window)
         }
+        ElementKind::Sticky(b) => paint_sticky(b, cam, origin, fill, window),
         ElementKind::Line(s) => paint_segment(
             s,
             false,
@@ -1084,6 +1085,71 @@ pub(crate) fn paint_box_polygon(
     if let Ok(path) = pb.build() {
         window.paint_path(path, ink);
     }
+}
+
+/// The default sticky-note paper (pale yellow) and the swatch row's choices.
+pub(crate) const STICKY_COLORS: [u32; 5] =
+    [0xFEF3A0FF, 0xFFC9DEFF, 0xBFE3FFFF, 0xC8F0C0FF, 0xFFD6A5FF];
+
+/// A sticky note's paper (`body`, the square less its folded corner) and the
+/// fold (`flap`), in unrotated world space. Shared by the canvas and export.
+pub(crate) fn sticky_parts(b: &BoxGeom) -> ([[f32; 2]; 5], [[f32; 2]; 3]) {
+    let f = b.w.abs().min(b.h.abs()) * 0.16;
+    let (x0, y0, x1, y1) = (b.x, b.y, b.x + b.w, b.y + b.h);
+    (
+        [[x0, y0], [x1, y0], [x1, y1 - f], [x1 - f, y1], [x0, y1]],
+        [[x1, y1 - f], [x1 - f, y1 - f], [x1 - f, y1]],
+    )
+}
+
+/// The fold's shade: the paper a little darker.
+pub(crate) fn sticky_flap(paper: Hsla) -> Hsla {
+    Hsla {
+        l: paper.l * 0.82,
+        ..paper
+    }
+}
+
+/// A sticky note: a soft two-layer shadow, the paper, and its folded corner
+/// — no outline, the shadow carries the edge.
+pub(crate) fn paint_sticky(
+    b: &BoxGeom,
+    cam: Camera,
+    origin: Point<Pixels>,
+    fill: Option<Hsla>,
+    window: &mut Window,
+) {
+    let (cx, cy) = (b.x + b.w / 2.0, b.y + b.h / 2.0);
+    let poly = |pts: &[[f32; 2]], dx: f32, dy: f32, color: Hsla, window: &mut Window| {
+        let mut pb = PathBuilder::fill();
+        for (i, p) in pts.iter().enumerate() {
+            let (wx, wy) = rotate_pt(p[0], p[1], cx, cy, b.rotation);
+            let at = to_screen(wx + dx, wy + dy, cam, origin);
+            if i == 0 {
+                pb.move_to(at);
+            } else {
+                pb.line_to(at);
+            }
+        }
+        pb.close();
+        if let Ok(path) = pb.build() {
+            window.paint_path(path, color);
+        }
+    };
+    let (body, flap) = sticky_parts(b);
+    let side = b.w.abs().min(b.h.abs());
+    let paper = fill.unwrap_or_else(|| u32_to_hsla(STICKY_COLORS[0]));
+    for (k, alpha) in [(0.045, 0.06), (0.022, 0.12)] {
+        poly(
+            &body,
+            side * k * 0.4,
+            side * k,
+            gpui::black().opacity(alpha),
+            window,
+        );
+    }
+    poly(&body, 0.0, 0.0, paper, window);
+    poly(&flap, 0.0, 0.0, sticky_flap(paper), window);
 }
 
 /// A rounded rectangle: straight edges joined by quarter-circle corners (radius

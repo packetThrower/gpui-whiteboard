@@ -22,7 +22,7 @@ world-space `f32` (see [`Camera`](#camera)).
 | [`Affine`](#export) | type alias | `[f32; 6]` | A 2-D transform (SVG `matrix`) |
 | [`Seg`](#export) | enum | `Move \| Line \| Quad \| Cubic \| Close` | One path segment |
 | [`Element`](#element) | struct | `{ id, kind, stroke, fill, label, label_color, styles, mindmap, group }` | One board element |
-| [`ElementKind`](#elementkind) | enum | 13 variants | What an element is (pen stroke, shape, text, …) |
+| [`ElementKind`](#elementkind) | enum | 14 variants | What an element is (pen stroke, shape, text, …) |
 | [`Stroke`](#stroke) | struct | `{ points, width }` | Freehand pen geometry |
 | [`BoxGeom`](#boxgeom) | struct | `{ x, y, w, h, width, rotation }` | Box-shape geometry (rect/ellipse/…) |
 | [`SegGeom`](#seggeom) | struct | `{ x1, y1, x2, y2, width, style, start_anchor, end_anchor }` | Line / arrow geometry |
@@ -243,6 +243,7 @@ pub enum ElementKind {
     RoundRect(BoxGeom),
     Star(BoxGeom),
     Hexagon(BoxGeom),
+    Sticky(BoxGeom),
     Line(SegGeom),
     Arrow(SegGeom),
     Text(TextGeom),
@@ -259,6 +260,7 @@ The kinds of thing a board can hold.
 | --- | --- | --- |
 | `Draw` | [`Stroke`](#stroke) | Freehand pen stroke |
 | `Rect` / `Ellipse` / `Diamond` / `Triangle` / `RoundRect` / `Star` / `Hexagon` | [`BoxGeom`](#boxgeom) | Closed shapes (fillable, labelable, rotatable) |
+| `Sticky` | [`BoxGeom`](#boxgeom) | A sticky note: paper in its `fill` color with a folded corner and a soft shadow, no outline; its label is written from the top-left |
 | `Line` / `Arrow` | [`SegGeom`](#seggeom) | Straight connectors (arrow has a head at `(x2, y2)`) |
 | `Text` | [`TextGeom`](#textgeom) | Free text |
 | `Embed` | [`EmbedGeom`](#embedgeom) | Page-card linking to a host page |

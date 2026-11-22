@@ -370,6 +370,9 @@ pub enum ElementKind {
     RoundRect(BoxGeom),
     Star(BoxGeom),
     Hexagon(BoxGeom),
+    /// A sticky note: a paper square with a folded corner and a soft shadow,
+    /// its label written from the top-left.
+    Sticky(BoxGeom),
     Line(SegGeom),
     Arrow(SegGeom),
     Text(TextGeom),
