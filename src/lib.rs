@@ -5301,6 +5301,51 @@ impl WhiteboardView {
         self.font.index_at_wrapped(content, size, wrap, [pos[0], y])
     }
 
+    /// The caret offset for Left (`dir = -1`) / Right (`dir = 1`): the neighbor
+    /// that moves that way on screen, so arrows follow right-to-left text.
+    /// Without `extend`, a selection collapses to its on-screen side.
+    fn caret_horizontal(
+        &self,
+        content: &str,
+        size: f32,
+        wrap: Option<f32>,
+        dir: i32,
+        extend: bool,
+    ) -> usize {
+        let pos = |b| self.font.caret_pos_wrapped(content, size, wrap, b);
+        let line = &content[line_start(content, self.caret)..line_end(content, self.caret)];
+        let rtl = unicode_bidi::ParagraphBidiInfo::new(line, None)
+            .paragraph_level
+            .is_rtl();
+        // Reading order: Left means "back" in left-to-right text, "forward" in RTL.
+        let back = (dir < 0) != rtl;
+        let (s, e) = self.sel_range();
+        if !extend && s < e {
+            let (ps, pe) = (pos(s), pos(e));
+            if (ps[1] - pe[1]).abs() > 0.5 {
+                return if back { s } else { e };
+            }
+            return if (ps[0] < pe[0]) == (dir < 0) { s } else { e };
+        }
+        let (prev, next) = (
+            caret_left(content, self.caret),
+            caret_right(content, self.caret),
+        );
+        let (first, second) = if back { (prev, next) } else { (next, prev) };
+        let cur = pos(self.caret);
+        let moves = |to: usize| {
+            let p = pos(to);
+            to != self.caret && (p[1] - cur[1]).abs() < 0.5 && (p[0] - cur[0]) * dir as f32 > 0.0
+        };
+        // ponytail: one step to whichever neighbor moves the right way; at a
+        // line's edge (or a wrap) fall back to reading order.
+        if moves(first) || !moves(second) {
+            first
+        } else {
+            second
+        }
+    }
+
     /// Apply one key press while editing text: caret navigation (arrows / Home /
     /// End, ⇧ extends), selection (⌘A, click-drag set elsewhere), clipboard
     /// (⌘C/X/V on the system clipboard), and insertion / deletion. Escape commits.
@@ -5387,22 +5432,9 @@ impl WhiteboardView {
         }
 
         match ks.key.as_str() {
-            "left" => {
-                let (s, e) = self.sel_range();
-                let to = if !shift && s < e {
-                    s
-                } else {
-                    caret_left(&content, self.caret)
-                };
-                self.move_caret(to, shift, cx);
-            }
-            "right" => {
-                let (s, e) = self.sel_range();
-                let to = if !shift && s < e {
-                    e
-                } else {
-                    caret_right(&content, self.caret)
-                };
+            "left" | "right" => {
+                let dir = if ks.key == "left" { -1 } else { 1 };
+                let to = self.caret_horizontal(&content, size, wrap, dir, shift);
                 self.move_caret(to, shift, cx);
             }
             "up" => {
@@ -10230,6 +10262,23 @@ mod board_tests {
             (id, b.checkbox_at([wx, wy]))
         });
         assert_eq!(hit, Some((id, raw.find("☐ two").unwrap())));
+    }
+
+    /// In right-to-left text, Left moves forward in the string and Right back.
+    #[gpui::test]
+    fn arrows_follow_right_to_left_text(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("t");
+        click(&mut cx, at(200.0, 200.0));
+        cx.simulate_input("שלום");
+        cx.simulate_keystrokes("left right right");
+        cx.simulate_input("x");
+        cx.simulate_keystrokes("escape");
+        let t = match &elements(&v, &cx)[0].kind {
+            ElementKind::Text(t) => t.content.clone(),
+            k => panic!("{k:?}"),
+        };
+        assert_eq!(t, "שלxום");
     }
 
     #[gpui::test]
