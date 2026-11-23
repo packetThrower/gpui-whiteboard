@@ -68,15 +68,21 @@ fn fontconfig_face(ch: char) -> Option<(&'static ttf_parser::Face<'static>, ttf_
     static FOUND: Mutex<Vec<(String, &'static ttf_parser::Face<'static>)>> = Mutex::new(Vec::new());
     static MISSES: OnceLock<Mutex<HashSet<char>>> = OnceLock::new();
     let mut found = FOUND.lock().ok()?;
-    if let Some((f, g)) = found
-        .iter()
-        .find_map(|(_, f)| Some((*f, f.glyph_index(ch)?)))
-    {
-        return Some((f, g));
+    let arabic = is_arabic(ch);
+    // A loaded face that has `ch` and can shape it; for Arabic, an Arabic
+    // family only (see the sort below), any face once fc-list has no better.
+    let loaded = |found: &[(String, &'static ttf_parser::Face<'static>)], any: bool| {
+        found.iter().find_map(|(p, f)| {
+            let named = !arabic || any || p.to_lowercase().contains("arab");
+            Some((*f, f.glyph_index(ch).filter(|_| named && can_shape(f, ch))?))
+        })
+    };
+    if let Some(hit) = loaded(&found, false) {
+        return Some(hit);
     }
     let mut misses = MISSES.get_or_init(Default::default).lock().ok()?;
     if misses.contains(&ch) {
-        return None;
+        return loaded(&found, true);
     }
     let hit = (|| {
         // fc-list, not fc-match: fc-match returns its best overall match even
@@ -91,26 +97,86 @@ fn fontconfig_face(ch: char) -> Option<(&'static ttf_parser::Face<'static>, ttf_
             .output()
             .ok()?;
         let out = String::from_utf8(out.stdout).ok()?;
-        let mut faces: Vec<(&str, &str)> = out
+        let mut faces: Vec<(&str, u32)> = out
             .lines()
             .filter_map(|l| l.split_once('\t'))
             .filter(|(p, _)| !found.iter().any(|(f, _)| f == p))
+            .map(|(p, i)| (p, i.trim().parse::<u32>().unwrap_or(0) & 0xFFFF))
             .collect();
-        // fc-list's order is arbitrary: prefer an upright regular face.
-        faces.sort_by_key(|(p, _)| !p.contains("Regular"));
-        let (path, index) = faces.first()?;
-        let bytes: &'static [u8] = Box::leak(std::fs::read(path).ok()?.into_boxed_slice());
-        let face: &'static _ = Box::leak(Box::new(
-            ttf_parser::Face::parse(bytes, index.trim().parse::<u32>().unwrap_or(0) & 0xFFFF)
-                .ok()?,
-        ));
-        found.push((path.to_string(), face));
-        Some((face, face.glyph_index(ch)?))
-    })();
+        // fc-list's order is arbitrary: catch-all faces (Unifont covers the
+        // whole BMP with no shaping tables) last; for Arabic, an Arabic family
+        // first, since math and number faces carry a few Arabic letters and a
+        // word split across faces can't join; then upright regular faces.
+        faces.sort_by_key(|(p, _)| {
+            let p = p.to_lowercase();
+            (
+                p.contains("unifont") || p.contains("lastresort"),
+                !(arabic && p.contains("arab")),
+                !p.contains("regular"),
+            )
+        });
+        // The first face that can shape `ch`; failing that, the first at all.
+        // ponytail: tries 8 faces at most, each a full file read.
+        let mut first = None;
+        for (path, index) in faces.into_iter().take(8) {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            let Ok(face) = ttf_parser::Face::parse(&bytes, index) else {
+                continue;
+            };
+            if face.glyph_index(ch).is_some() && can_shape(&face, ch) {
+                return Some(keep(&mut found, path, bytes, index, ch));
+            }
+            first.get_or_insert((path, bytes, index));
+        }
+        let (path, bytes, index) = first?;
+        Some(keep(&mut found, path, bytes, index, ch))
+    })()
+    .flatten();
     if hit.is_none() {
         misses.insert(ch);
     }
-    hit
+    hit.or_else(|| loaded(&found, true))
+}
+
+/// Leak `bytes` as a face kept for the process's life, add it to `found`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn keep(
+    found: &mut Vec<(String, &'static ttf_parser::Face<'static>)>,
+    path: &str,
+    bytes: Vec<u8>,
+    index: u32,
+    ch: char,
+) -> Option<(&'static ttf_parser::Face<'static>, ttf_parser::GlyphId)> {
+    let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+    let face: &'static _ = Box::leak(Box::new(ttf_parser::Face::parse(bytes, index).ok()?));
+    found.push((path.to_string(), face));
+    Some((face, face.glyph_index(ch)?))
+}
+
+/// Whether `face` can draw `ch` properly: a char that needs shaping (Arabic
+/// joining, Indic, marks) needs the face's OpenType substitutions, or every
+/// letter comes out in its isolated form.
+fn can_shape(face: &ttf_parser::Face, ch: char) -> bool {
+    if !needs_shaping(ch) {
+        return true;
+    }
+    let Some(gsub) = face.tables().gsub else {
+        return false;
+    };
+    // Arabic needs its own GSUB script: FreeMono has a GSUB table and Arabic
+    // glyphs but no Arabic rules, so its letters stay isolated.
+    // ponytail: only Arabic is checked by script; add tags as scripts need it.
+    !is_arabic(ch)
+        || gsub
+            .scripts
+            .index(ttf_parser::Tag::from_bytes(b"arab"))
+            .is_some()
+}
+
+fn is_arabic(ch: char) -> bool {
+    matches!(ch as u32, 0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF)
 }
 
 /// Which of a [`Faces`]' faces a glyph comes from.
@@ -158,19 +224,31 @@ impl<'a> Faces<'a> {
     /// The face that has `ch` and its glyph; the primary's `.notdef` when no
     /// face has it.
     fn glyph(&self, ch: char) -> (FaceId, ttf_parser::GlyphId) {
-        if let Some(g) = self.primary.glyph_index(ch) {
+        // A face that has `ch` and can shape it, then one that only has it.
+        let shaped = |f: &ttf_parser::Face| f.glyph_index(ch).filter(|_| can_shape(f, ch));
+        if let Some(g) = shaped(&self.primary) {
             return (FaceId::Primary, g);
         }
         if !ch.is_whitespace() && !ch.is_control() {
             for i in 0..self.fallbacks.len() {
                 // An absent fallback resolves to the primary, which lacks `ch`.
-                if let Some(g) = self.get(FaceId::Fallback(i)).glyph_index(ch) {
+                if let Some(g) = shaped(self.get(FaceId::Fallback(i))) {
                     return (FaceId::Fallback(i), g);
                 }
             }
             #[cfg(all(unix, not(target_os = "macos")))]
             if let Some((f, g)) = fontconfig_face(ch) {
                 return (FaceId::System(f), g);
+            }
+        }
+        if let Some(g) = self.primary.glyph_index(ch) {
+            return (FaceId::Primary, g);
+        }
+        if !ch.is_whitespace() && !ch.is_control() {
+            for i in 0..self.fallbacks.len() {
+                if let Some(g) = self.get(FaceId::Fallback(i)).glyph_index(ch) {
+                    return (FaceId::Fallback(i), g);
+                }
             }
         }
         (FaceId::Primary, ttf_parser::GlyphId(0))
