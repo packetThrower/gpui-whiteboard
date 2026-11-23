@@ -846,15 +846,43 @@ impl Font {
         dir: i32,
     ) -> Option<usize> {
         let (lines, _) = self.line_stops(content, font_size, max_width);
-        let line = lines.iter().find(|l| l.stops.iter().any(|s| s.0 == at))?;
-        let x = line.stops.iter().find(|s| s.0 == at)?.1;
-        line.stops
+        let i = lines
             .iter()
-            .filter(|s| (s.1 - x) * dir as f32 > 0.01)
+            .position(|l| l.stops.iter().any(|s| s.0 == at))?;
+        let line = &lines[i];
+        let x = line.stops.iter().find(|s| s.0 == at)?.1;
+        // A soft wrap's boundary offset sits on both lines but the caret draws
+        // it on the first; only stops a line owns are places to land there.
+        let owns = |j: usize, b: usize| j == 0 || !lines[j - 1].stops.iter().any(|s| s.0 == b);
+        let step = line
+            .stops
+            .iter()
+            .filter(|s| owns(i, s.0) && (s.1 - x) * dir as f32 > 0.01)
             .min_by(|a, b| {
                 let key = |s: &(usize, f32)| ((s.1 - x).abs(), s.0.abs_diff(at));
                 key(a).partial_cmp(&key(b)).unwrap()
-            })
+            });
+        if let Some(s) = step {
+            return Some(s.0);
+        }
+        // At the edge of a soft-wrapped line, continue on the paragraph's
+        // previous (reading back) or next visual line, entering from the side
+        // the caret is moving away from. Soft wraps share their boundary
+        // offset; a hard '\n' doesn't (→ `None`, the caller steps logically).
+        let back = (dir < 0) != line.rtl;
+        let j = if back { i.checked_sub(1)? } else { i + 1 };
+        let adj = lines.get(j)?;
+        let soft = adj
+            .stops
+            .iter()
+            .any(|s| line.stops.iter().any(|t| t.0 == s.0));
+        if !soft {
+            return None;
+        }
+        adj.stops
+            .iter()
+            .filter(|s| owns(j, s.0))
+            .min_by(|a, b| (a.1 * dir as f32).partial_cmp(&(b.1 * dir as f32)).unwrap())
             .map(|s| s.0)
     }
 
@@ -1311,6 +1339,38 @@ mod tests {
             assert!(n <= s.len(), "stuck");
         }
         assert!(x(at) < 0.01, "ended at {at}, x {}", x(at));
+    }
+
+    /// Arrows cross the soft wrap of a mixed RTL paragraph both ways and
+    /// reach the far end (no ping-pong at the wrap).
+    #[test]
+    fn caret_steps_cross_a_soft_wrap() {
+        let f = Font::from_bytes(DEFAULT_FONT.to_vec(), 0).unwrap();
+        for (s, rtl) in [
+            ("שלום 25 dollars טוב", true),
+            ("hello wide world again", false),
+            ("שלום עולם גדול מאוד", true),
+        ] {
+            wrap_walk(&f, s, rtl);
+        }
+    }
+
+    fn wrap_walk(f: &Font, s: &str, rtl: bool) {
+        let w = Some(f.measure(s, 20.0).0 * 0.55);
+        let walk = |from: usize, dir: i32| {
+            let mut at = from;
+            for _ in 0..2 * s.len() {
+                match f.caret_step_wrapped(s, 20.0, w, at, dir) {
+                    Some(n) => at = n,
+                    None => return at,
+                }
+            }
+            panic!("stuck walking {dir} from {from}");
+        };
+        assert!(f.line_stops(s, 20.0, w).0.len() > 1, "wraps");
+        let d = if rtl { -1 } else { 1 }; // the reading direction on screen
+        assert_eq!(walk(0, d), s.len(), "{s}: reaches the logical end");
+        assert_eq!(walk(s.len(), -d), 0, "{s}: reaches the logical start");
     }
 
     #[test]
