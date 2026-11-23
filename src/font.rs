@@ -68,15 +68,21 @@ fn fontconfig_face(ch: char) -> Option<(&'static ttf_parser::Face<'static>, ttf_
     static FOUND: Mutex<Vec<(String, &'static ttf_parser::Face<'static>)>> = Mutex::new(Vec::new());
     static MISSES: OnceLock<Mutex<HashSet<char>>> = OnceLock::new();
     let mut found = FOUND.lock().ok()?;
-    if let Some((f, g)) = found
-        .iter()
-        .find_map(|(_, f)| Some((*f, f.glyph_index(ch).filter(|_| can_shape(f, ch))?)))
-    {
-        return Some((f, g));
+    let arabic = is_arabic(ch);
+    // A loaded face that has `ch` and can shape it; for Arabic, an Arabic
+    // family only (see the sort below), any face once fc-list has no better.
+    let loaded = |found: &[(String, &'static ttf_parser::Face<'static>)], any: bool| {
+        found.iter().find_map(|(p, f)| {
+            let named = !arabic || any || p.to_lowercase().contains("arab");
+            Some((*f, f.glyph_index(ch).filter(|_| named && can_shape(f, ch))?))
+        })
+    };
+    if let Some(hit) = loaded(&found, false) {
+        return Some(hit);
     }
     let mut misses = MISSES.get_or_init(Default::default).lock().ok()?;
     if misses.contains(&ch) {
-        return None;
+        return loaded(&found, true);
     }
     let hit = (|| {
         // fc-list, not fc-match: fc-match returns its best overall match even
@@ -98,11 +104,14 @@ fn fontconfig_face(ch: char) -> Option<(&'static ttf_parser::Face<'static>, ttf_
             .map(|(p, i)| (p, i.trim().parse::<u32>().unwrap_or(0) & 0xFFFF))
             .collect();
         // fc-list's order is arbitrary: catch-all faces (Unifont covers the
-        // whole BMP with no shaping tables) last, upright regular faces first.
+        // whole BMP with no shaping tables) last; for Arabic, an Arabic family
+        // first, since math and number faces carry a few Arabic letters and a
+        // word split across faces can't join; then upright regular faces.
         faces.sort_by_key(|(p, _)| {
             let p = p.to_lowercase();
             (
                 p.contains("unifont") || p.contains("lastresort"),
+                !(arabic && p.contains("arab")),
                 !p.contains("regular"),
             )
         });
@@ -128,7 +137,7 @@ fn fontconfig_face(ch: char) -> Option<(&'static ttf_parser::Face<'static>, ttf_
     if hit.is_none() {
         misses.insert(ch);
     }
-    hit
+    hit.or_else(|| loaded(&found, true))
 }
 
 /// Leak `bytes` as a face kept for the process's life, add it to `found`.
@@ -159,12 +168,15 @@ fn can_shape(face: &ttf_parser::Face, ch: char) -> bool {
     // Arabic needs its own GSUB script: FreeMono has a GSUB table and Arabic
     // glyphs but no Arabic rules, so its letters stay isolated.
     // ponytail: only Arabic is checked by script; add tags as scripts need it.
-    let arabic = matches!(ch as u32, 0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF);
-    !arabic
+    !is_arabic(ch)
         || gsub
             .scripts
             .index(ttf_parser::Tag::from_bytes(b"arab"))
             .is_some()
+}
+
+fn is_arabic(ch: char) -> bool {
+    matches!(ch as u32, 0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF)
 }
 
 /// Which of a [`Faces`]' faces a glyph comes from.
