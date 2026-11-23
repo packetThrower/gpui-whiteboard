@@ -5301,8 +5301,8 @@ impl WhiteboardView {
         self.font.index_at_wrapped(content, size, wrap, [pos[0], y])
     }
 
-    /// The caret offset for Left (`dir = -1`) / Right (`dir = 1`): the neighbor
-    /// that moves that way on screen, so arrows follow right-to-left text.
+    /// The caret offset for Left (`dir = -1`) / Right (`dir = 1`): the next
+    /// caret stop that way on screen, so arrows follow right-to-left text.
     /// Without `extend`, a selection collapses to its on-screen side.
     fn caret_horizontal(
         &self,
@@ -5327,23 +5327,16 @@ impl WhiteboardView {
             }
             return if (ps[0] < pe[0]) == (dir < 0) { s } else { e };
         }
-        let (prev, next) = (
-            caret_left(content, self.caret),
-            caret_right(content, self.caret),
-        );
-        let (first, second) = if back { (prev, next) } else { (next, prev) };
-        let cur = pos(self.caret);
-        let moves = |to: usize| {
-            let p = pos(to);
-            to != self.caret && (p[1] - cur[1]).abs() < 0.5 && (p[0] - cur[0]) * dir as f32 > 0.0
-        };
-        // ponytail: one step to whichever neighbor moves the right way; at a
-        // line's edge (or a wrap) fall back to reading order.
-        if moves(first) || !moves(second) {
-            first
-        } else {
-            second
-        }
+        // At the line's edge (or a wrap), step on in reading order.
+        self.font
+            .caret_step_wrapped(content, size, wrap, self.caret, dir)
+            .unwrap_or_else(|| {
+                if back {
+                    caret_left(content, self.caret)
+                } else {
+                    caret_right(content, self.caret)
+                }
+            })
     }
 
     /// Apply one key press while editing text: caret navigation (arrows / Home /
@@ -10262,6 +10255,27 @@ mod board_tests {
             (id, b.checkbox_at([wx, wy]))
         });
         assert_eq!(hit, Some((id, raw.find("☐ two").unwrap())));
+    }
+
+    /// Left from the visual right edge walks through an embedded Latin run
+    /// to the visual left edge (the logical end).
+    #[gpui::test]
+    fn left_walks_through_mixed_text(cx: &mut TestAppContext) {
+        let (v, mut cx) = board(cx, false);
+        cx.simulate_keystrokes("t");
+        click(&mut cx, at(200.0, 200.0));
+        cx.simulate_input("שלום 25 dollars טוב");
+        cx.simulate_keystrokes("home");
+        for _ in 0..30 {
+            cx.simulate_keystrokes("left");
+        }
+        cx.simulate_input("x");
+        cx.simulate_keystrokes("escape");
+        let t = match &elements(&v, &cx)[0].kind {
+            ElementKind::Text(t) => t.content.clone(),
+            k => panic!("{k:?}"),
+        };
+        assert_eq!(t, "שלום 25 dollars טובx");
     }
 
     /// In right-to-left text, Left moves forward in the string and Right back.
