@@ -8,8 +8,9 @@ and zoom without limit. Elements can be selected, moved, resized, rotated, and
 reordered; a toolbar, color picker, templates, copy and paste, and undo/redo
 are built in.
 
-It depends on `gpui`, `serde`/`serde_json`, `log`, and `ttf-parser` only, with
-no native libraries, so it drops into any GPUI app on macOS, Linux, or Windows.
+It depends on `gpui`, `serde`/`serde_json`, `log`, `ttf-parser`, `rustybuzz`,
+and `unicode-bidi` only, with no native libraries, so it drops into any GPUI app
+on macOS, Linux, or Windows.
 There are two layers:
 
 - a plain, serializable **scene model** ([`Scene`](#the-scene-model) /
@@ -26,7 +27,8 @@ There are two layers:
   modal, and a right-click context menu. Drop the entity in and it's a working
   whiteboard.
 - **Rich element set.** Freehand pen, rectangle, ellipse, diamond, triangle, rounded
-  rectangle, hexagon, 5-point star, line, arrow, text, images, and page-cards — all
+  rectangle, hexagon, 5-point star, sticky note, straight and curved lines and
+  arrows, text, images, page-cards, and starter mind maps and flowcharts — all
   share one select / move / resize / rotate / fill machinery.
 - **Pan / zoom infinite canvas.** World-space coordinates with a [`Camera`] (pan
   offset + zoom); drag to pan, scroll/pinch to zoom, snap-to-grid while holding ⌥.
@@ -34,6 +36,12 @@ There are two layers:
   gpui overlay glyphs — so it rotates, scales, and z-orders exactly like shapes, and
   you can swap in a [custom/user-uploaded face](#custom-fonts). JetBrains Mono ships
   bundled, so the crate works standalone.
+- **Any script, either direction.** Arabic letters join, Hebrew and Arabic read
+  right to left (mixed with left-to-right text on the same line), and the caret,
+  selection and arrow keys follow what's on screen. A character the board's face
+  lacks is drawn from a system font that has it, one character at a time, so
+  CJK, Hangul, Arabic or Hebrew show up even in an uploaded Latin-only face. See
+  [How it works](#how-it-works).
 - **Auto-fitting shape labels.** Double-click any closed shape (rect / ellipse /
   diamond / triangle / rounded-rect / star / hexagon) to type a centered label. The
   text word-wraps and auto-shrinks to fit the shape's *inscribed* area — staying
@@ -73,8 +81,8 @@ There are two layers:
   `☐` box (`[x] ` a ticked `☑`). Enter continues the list, Enter on an empty
   item ends it, and clicking a box ticks it. The marks are plain characters,
   so they survive search, copy and export.
-- **Export.** `Scene::to_drawing` turns a board into vector paths the host can
-  save as SVG (`Drawing::to_svg`) or rasterize to PNG.
+- **PNG / SVG export.** `Scene::to_drawing` turns a board into vector paths the
+  host can save as SVG (`Drawing::to_svg`) or rasterize to PNG.
 - **Theme-reactive.** Colors come from a `Fn() -> WhiteboardStyle` closure read at
   paint time, so the board follows live theme / light-dark changes (and can differ
   per window) with no push from the host.
@@ -402,6 +410,8 @@ pub struct Element {
     pub label:  Option<String>, // closed shapes only; centered, word-wrapped + auto-shrunk to fit
     pub label_color: Option<u32>, // shape label color; None = follow the stroke / theme ink
     pub styles: Vec<StyleSpan>,   // per-character bold/italic/underline/strike/highlight runs
+    pub mindmap: Option<MindMapNodeMeta>, // mind-map tree bookkeeping; None = ordinary element
+    pub group: Option<u64>,       // ⌘G group id; None = ungrouped
 }
 
 pub enum ElementKind {       // serialized snake_case: {"rect": {...}}, {"image": {...}}, …
@@ -417,7 +427,9 @@ pub enum ElementKind {       // serialized snake_case: {"rect": {...}}, {"image"
 
 pub struct Stroke   { pub points: Vec<[f32; 2]>, pub width: f32 }
 pub struct BoxGeom  { pub x: f32, pub y: f32, pub w: f32, pub h: f32, pub width: f32, pub rotation: f32 }
-pub struct SegGeom  { pub x1: f32, pub y1: f32, pub x2: f32, pub y2: f32, pub width: f32 }
+pub struct SegGeom  { pub x1: f32, pub y1: f32, pub x2: f32, pub y2: f32, pub width: f32,
+                      pub style: SegmentStyle, pub start_anchor: Option<SegmentAnchor>,
+                      pub end_anchor: Option<SegmentAnchor>, pub bend: f32, pub bend_at: f32 }
 pub struct TextGeom { pub x: f32, pub y: f32, pub content: String, pub size: f32, pub rotation: f32, /* measured_* cached */ }
 pub struct EmbedGeom{ pub page_id: i64, pub title: String, pub x: f32, pub y: f32, pub w: f32, pub h: f32 }
 pub struct ImageGeom{ pub src: String, pub x: f32, pub y: f32, pub w: f32, pub h: f32, pub rotation: f32 }
@@ -430,8 +442,9 @@ world-space; multiply by `camera.zoom` and subtract the pan offset for screen sp
 
 ```rust
 pub enum Tool {
-    Pan, Select, Pen, Rect, Ellipse, Diamond, Triangle,
-    RoundRect, Star, Hexagon, Line, Arrow, Text, Embed, Image,
+    Pan, Select, Pen, Rect, Ellipse, Diamond, Triangle, RoundRect, Star, Hexagon,
+    Line, Arrow, DashedArrow, CurvedLine, CurvedArrow, CurvedDashedArrow,
+    Text, Sticky, MindMap, Flowchart, Embed, Image,
 }
 ```
 
@@ -455,14 +468,15 @@ impl Template {
 ### Custom fonts
 
 Text is drawn from glyph outlines, so any TrueType/OpenType face works. The default is
-bundled (JetBrains Mono, OFL); swap one in directly with `set_font`:
+a broad Unicode/CJK system face when one is installed, else the bundled JetBrains Mono
+(OFL); swap one in directly with `set_font`:
 
 ```rust
 use gpui_whiteboard::Font;
 if let Some(face) = Font::from_bytes(ttf_bytes, /* face index */ 0) {
     board.update(cx, |v, cx| v.set_font(face, cx));
 }
-// Font::default() is the bundled face.
+// Font::default() is the system Unicode/CJK face, or the bundled one.
 ```
 
 For a user-facing picker, install `set_on_pick_font`: the toolbar then shows an **Aa**
@@ -471,13 +485,30 @@ button whose flyout offers *Upload font…* and *Use default*. The crate hands y
 `set_font`, and persist the choice however you like (the host app keeps one face per
 board, restored on reopen).
 
+## How it works
+
+Board text is laid out by the crate itself, not by gpui's text system, so it can
+be turned into outlines:
+
+- **Fallback.** Each character comes from the first face that has it: the board's
+  font, then a fixed list of common system fonts (Segoe UI, SF Arabic / Hebrew,
+  Apple SD Gothic Neo, DejaVu Sans, Noto Sans, …), then on Linux whatever
+  fontconfig (`fc-list`) reports for that character. Fallback fonts are read the
+  first time a character needs them.
+- **Shaping.** Scripts whose letters change form (Arabic, Hebrew points, Indic,
+  Thai, combining marks) are shaped with `rustybuzz`; Arabic is only taken from a
+  face that can join it.
+- **Direction.** Each line is a Unicode bidi paragraph (`unicode-bidi`) whose
+  direction comes from its first strong character. Right-to-left lines align
+  right, and stickies start them at the right edge.
+
 ## Keyboard & mouse
 
 The view handles these when it has focus (it focuses on a canvas click):
 
 | Input | Action |
 | --- | --- |
-| `H` `V` `P` `R` `O` `D` `G` `U` `S` `X` `L` `A` `T` `N` `I` | pick a tool (pan, select, pen, rect, ellipse, diamond, triangle, rounded-rect, star, hexagon, line, arrow, text, sticky note, image) |
+| `H` `V` `P` `R` `O` `D` `G` `U` `S` `X` `L` `A` `K` `T` `N` `M` `F` `I` | pick a tool (pan, select, pen, rect, ellipse, diamond, triangle, rounded-rect, star, hexagon, line, arrow, dashed arrow, text, sticky note, mind map, flowchart, image) |
 | `⌫` / `Delete` | delete the selection |
 | `⌘Z` / `⌘⇧Z` | undo / redo |
 | `⌘C` / `⌘X` / `⌘V` | copy / cut / paste the selection |
@@ -514,11 +545,11 @@ and templates round-trip through your `SaveTemplateFn` + `set_templates`.
 
 ## Status
 
-Pre-1.0 (`0.1`). The scene JSON is forward-leaning — new fields use serde defaults, so
+Pre-1.0 (`0.6`). The scene JSON is forward-leaning — new fields use serde defaults, so
 older boards keep loading — but the API may still shift before 1.0. Performance note:
-elements are re-tessellated each paint (as GPUI's own `painting` examples do); a
-built-`Path` cache + viewport culling is the planned optimization once boards get
-large.
+elements are re-tessellated each paint (as GPUI's own `painting` examples do), but
+rendering is viewport-culled and text layouts are cached; a built-`Path` cache is
+the next optimization for very dense boards.
 
 ## License
 
