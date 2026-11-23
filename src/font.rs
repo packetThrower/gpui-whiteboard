@@ -150,7 +150,21 @@ fn keep(
 /// joining, Indic, marks) needs the face's OpenType substitutions, or every
 /// letter comes out in its isolated form.
 fn can_shape(face: &ttf_parser::Face, ch: char) -> bool {
-    !needs_shaping(ch) || face.tables().gsub.is_some()
+    if !needs_shaping(ch) {
+        return true;
+    }
+    let Some(gsub) = face.tables().gsub else {
+        return false;
+    };
+    // Arabic needs its own GSUB script: FreeMono has a GSUB table and Arabic
+    // glyphs but no Arabic rules, so its letters stay isolated.
+    // ponytail: only Arabic is checked by script; add tags as scripts need it.
+    let arabic = matches!(ch as u32, 0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF);
+    !arabic
+        || gsub
+            .scripts
+            .index(ttf_parser::Tag::from_bytes(b"arab"))
+            .is_some()
 }
 
 /// Which of a [`Faces`]' faces a glyph comes from.
