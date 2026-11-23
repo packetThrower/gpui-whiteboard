@@ -17,7 +17,8 @@ world-space `f32` (see [`Camera`](#camera)).
 | [`Scene::from_json`](#scenefrom_json) | assoc fn | `fn from_json(s: &str) -> Self` | Parse stored JSON; empty board on bad input |
 | [`Scene::to_json`](#sceneto_json) | method | `fn to_json(&self) -> String` | Serialize for persistence |
 | [`Scene::to_drawing`](#export) | method | `fn to_drawing(&self, font: &Font, ink: Hsla) -> Option<Drawing>` | The board as vector paths for PNG / SVG export |
-| [`Drawing`](#export) | struct | `{ bounds, items }` | A board ready to export; `to_svg` writes an SVG |
+| [`Drawing`](#export) | struct | `{ bounds, items }` | A board ready to export |
+| [`Drawing::to_svg`](#export) | method | `fn to_svg(&self, background: Option<u32>, image_href: impl Fn(&str) -> Option<String>) -> String` | The drawing as an SVG document |
 | [`DrawItem`](#export) | enum | `Path \| Image` | One thing to draw |
 | [`Affine`](#export) | type alias | `[f32; 6]` | A 2-D transform (SVG `matrix`) |
 | [`Seg`](#export) | enum | `Move \| Line \| Quad \| Cubic \| Close` | One path segment |
@@ -26,17 +27,29 @@ world-space `f32` (see [`Camera`](#camera)).
 | [`Stroke`](#stroke) | struct | `{ points, width }` | Freehand pen geometry |
 | [`BoxGeom`](#boxgeom) | struct | `{ x, y, w, h, width, rotation }` | Box-shape geometry (rect/ellipse/…) |
 | [`SegGeom`](#seggeom) | struct | `{ x1, y1, x2, y2, width, style, start_anchor, end_anchor, bend, bend_at }` | Line / arrow geometry, straight or curved |
+| [`SegGeom::control`](#seggeom) | method | `fn control(&self) -> Option<[f32; 2]>` | The curve's Bézier control point (`None` when straight) |
+| [`SegGeom::bend_point`](#seggeom) | method | `fn bend_point(&self) -> [f32; 2]` | The curve's peak, where the bend handle sits |
+| [`SegGeom::bend_toward`](#seggeom) | method | `fn bend_toward(&self, p: [f32; 2]) -> f32` | The `bend` that puts the peak nearest `p` |
+| [`SegGeom::bend_at_toward`](#seggeom) | method | `fn bend_at_toward(&self, p: [f32; 2]) -> f32` | The `bend_at` that slides the peak toward `p` |
+| [`SegGeom::points`](#seggeom) | method | `fn points(&self, n: usize) -> Vec<[f32; 2]>` | Sample the line or curve |
 | [`SegmentStyle`](#segmentstyle) | enum | `Solid \| Dashed` | A line/arrow's stroke style |
 | [`SegmentAnchor`](#segmentanchor) | struct | `{ element_id, connector }` | A segment endpoint bound to a shape |
 | [`MindMapNodeMeta`](#mindmapnodemeta) | struct | `{ parent, side, order, root_direction, connector_style }` | Mind-map metadata on an element |
-| [`MindMapSide`](#mindmap-enums) | enum | `Left \| Right` | Which side of the root a branch hangs |
-| [`MindMapRootDirection`](#mindmap-enums) | enum | `Both \| Left \| Right` | Root's growth direction |
-| [`MindMapConnectorStyle`](#mindmap-enums) | enum | `Straight \| Bezier \| Orthogonal` | Mind-map connector rendering |
-| [`LocalThumbnailMode`](#local-thumbnails) | enum | thumbnail framing modes | How a snapshot frames the scene |
-| [`LocalThumbnailSpec`](#local-thumbnails) | struct | framing + size | A thumbnail's render parameters |
-| [`LocalThumbnailSnapshot`](#local-thumbnails) | struct | `{ scene, camera, spec, … }` | A frozen scene + framing for a thumbnail |
+| [`MindMapSide`](#mind-map-enums) | enum | `Left \| Right` | Which side of the root a branch hangs |
+| [`MindMapRootDirection`](#mind-map-enums) | enum | `Both \| Left \| Right` | Root's growth direction |
+| [`MindMapConnectorStyle`](#mind-map-enums) | enum | `Straight \| Bezier \| Orthogonal` | Mind-map connector rendering |
+| [`LocalThumbnailMode`](#local-thumbnails) | enum | `Auto \| Selection \| Viewport \| AllContent \| Element(u64)` | What a thumbnail focuses on |
+| [`LocalThumbnailSpec`](#local-thumbnails) | struct | `{ anchor_element_id, focus_bounds, scene_bounds, camera }` | A thumbnail's framing |
+| [`LocalThumbnailSnapshot`](#local-thumbnails) | struct | `{ scene, spec }` | A frozen scene + framing for a thumbnail |
+| [`LocalThumbnailSnapshot::for_scene_all_content`](#local-thumbnails) | assoc fn | `fn for_scene_all_content(scene: Scene, width_px: f32, height_px: f32) -> Self` | Frame a stored scene's whole content, no view needed |
 | [`BoardEmbedView`](#boardembedview) | struct | entity | A read-only embedded board + Edit button |
+| [`BoardEmbedView::new`](#boardembedview) | constructor | `fn new(scene: Scene, style: WhiteboardStyleFn, cx: &mut Context<Self>) -> Self` | Build the embed over a scene |
+| [`BoardEmbedView::board`](#boardembedview) | method | `fn board(&self) -> Entity<WhiteboardView>` | The inner board entity |
+| [`BoardEmbedView::set_on_expand`](#boardembedview) | method | `fn set_on_expand(&mut self, f: ExpandEmbedFn)` | Install the Edit-button hook |
 | [`BoardThumbnailView`](#boardthumbnailview) | struct | entity | A static thumbnail rendering of a snapshot |
+| [`BoardThumbnailView::new`](#boardthumbnailview) | constructor | `fn new(snapshot: LocalThumbnailSnapshot, style: WhiteboardStyleFn) -> Self` | Build the thumbnail view |
+| [`BoardThumbnailView::snapshot`](#boardthumbnailview) | method | `fn snapshot(&self) -> &LocalThumbnailSnapshot` | The snapshot being drawn |
+| [`BoardThumbnailView::set_snapshot`](#boardthumbnailview) | method | `fn set_snapshot(&mut self, snapshot: LocalThumbnailSnapshot)` | Swap the snapshot to refresh |
 | [`ExpandEmbedFn`](#boardembedview) | type alias | `Rc<dyn Fn(&mut Window, &mut App)>` | Embed's Edit button clicked |
 | [`TextGeom`](#textgeom) | struct | `{ x, y, content, size, rotation, … }` | Free-text geometry |
 | [`EmbedGeom`](#embedgeom) | struct | `{ page_id, title, x, y, w, h }` | Page-card geometry |
@@ -66,6 +79,9 @@ world-space `f32` (see [`Camera`](#camera)).
 | [`Template::from_json`](#templatefrom_json) | assoc fn | `fn from_json(id: i64, name: impl Into<String>, elements_json: &str) -> Self` | Build from the host's stored row |
 | [`WhiteboardView`](#whiteboardview) | struct | `impl Render + Focusable` | The board entity: canvas + entire editing UI |
 | [`WhiteboardView::new`](#whiteboardviewnew) | constructor | `fn new(scene, style, cx) -> Self` | Build a view over a scene |
+| [`WhiteboardView::new_read_only`](#read-only-mode) | constructor | `fn new_read_only(scene, style, cx) -> Self` | Build a read-only view (no toolbar, no editing) |
+| [`WhiteboardView::set_read_only`](#read-only-mode) | method | `fn set_read_only(&mut self, read_only: bool, cx)` | Toggle read-only mode |
+| [`WhiteboardView::read_only`](#read-only-mode) | method | `fn read_only(&self) -> bool` | Whether the view is read-only |
 | [`WhiteboardView::set_on_change`](#whiteboardviewset_on_change) | method | `fn set_on_change(&mut self, f: ChangeFn)` | Install the persistence hook |
 | [`WhiteboardView::set_on_place_embed`](#whiteboardviewset_on_place_embed) | method | `fn set_on_place_embed(&mut self, f: PlaceEmbedFn)` | Install the page-card placement hook |
 | [`WhiteboardView::set_on_open`](#whiteboardviewset_on_open) | method | `fn set_on_open(&mut self, f: OpenPageFn)` | Install the open-page hook |
@@ -86,9 +102,17 @@ world-space `f32` (see [`Camera`](#camera)).
 | [`WhiteboardView::set_font`](#whiteboardviewset_font) | method | `fn set_font(&mut self, font: Font, cx)` | Swap the text face |
 | [`WhiteboardView::add_embed`](#whiteboardviewadd_embed) | method | `fn add_embed(&mut self, page_id, title, x, y, cx)` | Insert a page-card (host, after `PlaceEmbedFn`) |
 | [`WhiteboardView::add_image_at`](#whiteboardviewadd_image_at) | method | `fn add_image_at(&mut self, src, px_w, px_h, cx_world, cy_world, cx)` | Insert an image (host, after `PlaceImageFn`/drop) |
+| [`WhiteboardView::add_mindmap_seed`](#mind-map--flowchart-seeds) | method | `fn add_mindmap_seed(&mut self, center_x, center_y, cx)` | Insert a starter mind map at a world point |
+| [`WhiteboardView::add_mindmap_seed_at_viewport_center`](#mind-map--flowchart-seeds) | method | `fn add_mindmap_seed_at_viewport_center(&mut self, cx)` | Ditto, at the viewport center |
+| [`WhiteboardView::add_flowchart_seed`](#mind-map--flowchart-seeds) | method | `fn add_flowchart_seed(&mut self, center_x, center_y, cx)` | Insert a starter flowchart at a world point |
+| [`WhiteboardView::add_flowchart_seed_at_viewport_center`](#mind-map--flowchart-seeds) | method | `fn add_flowchart_seed_at_viewport_center(&mut self, cx)` | Ditto, at the viewport center |
 | [`WhiteboardView::viewport_center`](#whiteboardviewviewport_center) | method | `fn viewport_center(&self) -> [f32; 2]` | World point at the viewport center |
 | [`WhiteboardView::scene`](#whiteboardviewscene) | method | `fn scene(&self) -> &Scene` | Borrow the current board document |
 | [`WhiteboardView::tool`](#whiteboardviewtool) | method | `fn tool(&self) -> Tool` | The active tool |
+| [`WhiteboardView::local_thumbnail_spec`](#local-thumbnails) | method | `fn local_thumbnail_spec(&self, width_px, height_px) -> Option<LocalThumbnailSpec>` | Thumbnail framing, `Auto` mode |
+| [`WhiteboardView::local_thumbnail_spec_for_mode`](#local-thumbnails) | method | `fn local_thumbnail_spec_for_mode(&self, mode, width_px, height_px) -> Option<LocalThumbnailSpec>` | Thumbnail framing for a given mode |
+| [`WhiteboardView::local_thumbnail_snapshot`](#local-thumbnails) | method | `fn local_thumbnail_snapshot(&self, width_px, height_px) -> Option<LocalThumbnailSnapshot>` | Scene + framing, `Auto` mode |
+| [`WhiteboardView::local_thumbnail_snapshot_for_mode`](#local-thumbnails) | method | `fn local_thumbnail_snapshot_for_mode(&self, mode, width_px, height_px) -> Option<LocalThumbnailSnapshot>` | Scene + framing for a given mode |
 | [`WhiteboardView::set_tool`](#whiteboardviewset_tool) | method | `fn set_tool(&mut self, tool: Tool, cx)` | Switch the active tool |
 | [`WhiteboardView::reset_view`](#whiteboardviewreset_view) | method | `fn reset_view(&mut self, cx)` | Back to the origin at 100% |
 | [`WhiteboardView::zoom_in`](#whiteboardviewzoom_in--whiteboardviewzoom_out) | method | `fn zoom_in(&mut self, cx)` | Zoom a step about the canvas center |
@@ -99,23 +123,26 @@ world-space `f32` (see [`Camera`](#camera)).
 | `impl Render for WhiteboardView` | trait impl | — | Renders the board + its whole editing UI |
 | [`Font`](#font) | struct | `Clone` (cheap) | A TTF/OTF face backing whiteboard text |
 | [`Font::from_bytes`](#fontfrom_bytes) | assoc fn | `fn from_bytes(bytes: Vec<u8>, index: u32) -> Option<Self>` | Build from raw face bytes |
-| `impl Default for Font` | trait impl | `fn default() -> Self` | The bundled JetBrains Mono face |
+| `impl Default for Font` | trait impl | `fn default() -> Self` | A system Unicode/CJK face if installed, else the bundled JetBrains Mono |
+| [`Font::layout`](#fontlayout--fontlayout_wrapped--fontlayout_styled) | method | `fn layout(&self, content, font_size) -> TextLayout` | Glyph outlines, unwrapped (return type not exported — see note) |
 | [`Font::measure`](#fontmeasure--fontmeasure_wrapped) | method | `fn measure(&self, content, font_size) -> (f32, f32)` | Text block extent, unwrapped |
 | [`Font::measure_wrapped`](#fontmeasure--fontmeasure_wrapped) | method | `fn measure_wrapped(&self, content, font_size, max_width) -> (f32, f32)` | Text block extent with word-wrap |
 | [`Font::fit_size`](#fontfit_size) | method | `fn fit_size(&self, content, max_w, max_h, max_size) -> f32` | Largest font size that fits a box |
 | [`Font::caret_pos`](#fontcaret_pos--fontcaret_pos_wrapped) | method | `fn caret_pos(&self, content, font_size, at) -> [f32; 2]` | Caret top-left at a byte offset |
 | [`Font::caret_pos_wrapped`](#fontcaret_pos--fontcaret_pos_wrapped) | method | `fn caret_pos_wrapped(&self, content, font_size, max_width, at) -> [f32; 2]` | Ditto, honoring a wrap width |
-| [`Font::index_at_wrapped`](#fontindex_at_wrapped) | method | `fn index_at_wrapped(&self, content, font_size, max_width, p) -> usize` | Byte offset nearest a local point |
+| [`Font::caret_step_wrapped`](#fontcaret_step_wrapped) | method | `fn caret_step_wrapped(&self, content, font_size, max_width, at, dir) -> Option<usize>` | The caret stop one step left/right on screen |
+| [`Font::index_at`](#fontindex_at--fontindex_at_wrapped) | method | `fn index_at(&self, content, font_size, p) -> usize` | Byte offset nearest a local point |
+| [`Font::index_at_wrapped`](#fontindex_at--fontindex_at_wrapped) | method | `fn index_at_wrapped(&self, content, font_size, max_width, p) -> usize` | Ditto, honoring a wrap width |
 | [`Font::selection_rects`](#fontselection_rects--fontselection_rects_wrapped) | method | `fn selection_rects(&self, content, font_size, start, end) -> Vec<[f32; 4]>` | Selection highlight rects |
 | [`Font::selection_rects_wrapped`](#fontselection_rects--fontselection_rects_wrapped) | method | `fn selection_rects_wrapped(&self, content, font_size, max_width, start, end) -> Vec<[f32; 4]>` | Ditto, honoring a wrap width |
-| [`Font::layout_wrapped`](#fontlayout_wrapped--fontlayout_styled-crate-internal) | method | `fn layout_wrapped(…) -> TextLayout` | Glyph outlines (return type not exported — see note) |
-| [`Font::layout_styled`](#fontlayout_wrapped--fontlayout_styled-crate-internal) | method | `fn layout_styled(…) -> StyledLayout` | Styled glyph outlines (not callable externally — see note) |
+| [`Font::layout_wrapped`](#fontlayout--fontlayout_wrapped--fontlayout_styled) | method | `fn layout_wrapped(…) -> TextLayout` | Glyph outlines, wrapped (return type not exported — see note) |
+| [`Font::layout_styled`](#fontlayout--fontlayout_wrapped--fontlayout_styled) | method | `fn layout_styled(…) -> StyledLayout` | Styled glyph outlines (not callable externally — see note) |
 
 `Scene`, `Element`, `ElementKind`, the geometry structs, `Camera`, `RunStyle`,
 and `StyleSpan` all derive `Clone`, `Debug`, `Serialize`, and `Deserialize`
 (`Scene` and `RunStyle` also `Default`; `Camera` has a hand-written `Default` =
 origin at zoom 1). `Tool`, `Format`, and `FontPick` are `Clone + Copy +
-PartialEq + Eq + Debug`. Nothing here is `Send`: the view is a gpui entity and
+PartialEq + Eq + Debug`, as is `LocalThumbnailMode`. Nothing here is `Send`: the view is a gpui entity and
 the callbacks are `Rc`s — main-thread only, like all gpui UI ([`Font`](#font)
 is the one exception).
 
@@ -222,9 +249,10 @@ One board element: a stable id plus its geometry/kind and appearance.
 | `label` | `Option<String>` | Centered text label for closed shapes, word-wrapped and auto-shrunk to the shape's *inscribed* area. `None`/empty = no label; ignored by non-shape kinds. |
 | `label_color` | `Option<u32>` | Color of `label`; `None` follows `stroke` (theme ink if that's unset too). |
 | `styles` | `Vec<StyleSpan>` | Rich-text runs over the element's text (a Text element's content, or a shape's label). Kept sorted, non-overlapping, non-plain; empty = unstyled. |
+| `mindmap` | `Option<MindMapNodeMeta>` | Mind-map bookkeeping when the element is a node of a mind-map tree (see [`MindMapNodeMeta`](#mindmapnodemeta)); `None` for ordinary elements. |
 | `group` | `Option<u64>` | Group id (⌘G): elements sharing one select, move and copy together. `None` = ungrouped. Copies get a fresh id. |
 
-**Serialization** — `stroke` / `fill` / `label` / `label_color` / `group` are omitted
+**Serialization** — `stroke` / `fill` / `label` / `label_color` / `mindmap` / `group` are omitted
 when `None`, `styles` when empty; all take defaults on load, so pre-feature
 boards keep loading.
 
@@ -261,7 +289,7 @@ The kinds of thing a board can hold.
 | `Draw` | [`Stroke`](#stroke) | Freehand pen stroke |
 | `Rect` / `Ellipse` / `Diamond` / `Triangle` / `RoundRect` / `Star` / `Hexagon` | [`BoxGeom`](#boxgeom) | Closed shapes (fillable, labelable, rotatable) |
 | `Sticky` | [`BoxGeom`](#boxgeom) | A sticky note: paper in its `fill` color with a folded corner and a soft shadow, no outline; its label is written from the top-left |
-| `Line` / `Arrow` | [`SegGeom`](#seggeom) | Straight connectors (arrow has a head at `(x2, y2)`) |
+| `Line` / `Arrow` | [`SegGeom`](#seggeom) | Connectors, straight or curved (see `SegGeom::bend`); an arrow has a head at `(x2, y2)` |
 | `Text` | [`TextGeom`](#textgeom) | Free text |
 | `Embed` | [`EmbedGeom`](#embedgeom) | Page-card linking to a host page |
 | `Image` | [`ImageGeom`](#imagegeom) | Image referencing a host-managed file |
@@ -432,24 +460,69 @@ Selecting a root offers Direction and Connector pickers in the context UI;
 ## Local thumbnails
 
 ```rust
-pub enum LocalThumbnailMode { /* framing modes */ }
-pub struct LocalThumbnailSpec { /* framing + pixel size */ }
+pub enum LocalThumbnailMode {
+    Auto,
+    Selection,
+    Viewport,
+    AllContent,
+    Element(u64),
+}
+
+pub struct LocalThumbnailSpec {
+    pub anchor_element_id: Option<u64>,
+    pub focus_bounds: [f32; 4],
+    pub scene_bounds: Option<[f32; 4]>,
+    pub camera: Camera,
+}
+
 pub struct LocalThumbnailSnapshot {
     pub scene: Scene,
-    pub camera: Camera,
     pub spec: LocalThumbnailSpec,
 }
 
 impl LocalThumbnailSnapshot {
     pub fn for_scene_all_content(scene: Scene, width_px: f32, height_px: f32) -> Self
 }
+
+impl WhiteboardView {
+    pub fn local_thumbnail_spec(&self, width_px: f32, height_px: f32) -> Option<LocalThumbnailSpec>
+    pub fn local_thumbnail_spec_for_mode(&self, mode: LocalThumbnailMode, width_px: f32, height_px: f32) -> Option<LocalThumbnailSpec>
+    pub fn local_thumbnail_snapshot(&self, width_px: f32, height_px: f32) -> Option<LocalThumbnailSnapshot>
+    pub fn local_thumbnail_snapshot_for_mode(&self, mode: LocalThumbnailMode, width_px: f32, height_px: f32) -> Option<LocalThumbnailSnapshot>
+}
 ```
 
 A frozen scene plus the framing needed to paint it small. Build one with
 `for_scene_all_content` (frames the whole board's content into
-`width_px × height_px`) and hand it to a
+`width_px × height_px`, no view needed) or from a live view with
+`local_thumbnail_snapshot*`, and hand it to a
 [`BoardThumbnailView`](#boardthumbnailview). Pure data — cheap to clone/store;
 re-snapshot when the scene changes.
+
+**`LocalThumbnailMode` variants**
+
+| Variant | Focuses on |
+| --- | --- |
+| `Auto` | The selection if any, else the current viewport, else all content. |
+| `Selection` | The current selection (`None` from the methods when nothing is selected). |
+| `Viewport` | What the camera currently shows. |
+| `AllContent` | Every element's bounds (`None` for an empty board). |
+| `Element(id)` | One element (`None` if `id` isn't on the board). |
+
+**`LocalThumbnailSpec` fields**
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `anchor_element_id` | `Option<u64>` | The focused element, when the focus is a single element. |
+| `focus_bounds` | `[f32; 4]` | The focused area, world space, `[x0, y0, x1, y1]`. |
+| `scene_bounds` | `Option<[f32; 4]>` | Bounds of the whole scene, same form; `None` for an empty board. |
+| `camera` | [`Camera`](#camera) | The camera that frames `focus_bounds` (with padding) into `width_px × height_px`. |
+
+**The `WhiteboardView` methods** — `local_thumbnail_spec` /
+`local_thumbnail_snapshot` use `Auto`; the `_for_mode` variants take a mode.
+`width_px`, `height_px` are the thumbnail's pixel size (floored at 1). They
+return `None` when the mode has nothing to focus on. The snapshot clones the
+scene.
 
 ---
 
@@ -470,7 +543,7 @@ A read-only board embedded inside another surface (a document, a preview
 pane): renders the scene with pan/zoom wheel input suppressed and an "Edit"
 button overlaid; `set_on_expand` receives the click so the HOST runs its own
 maximize / open-editor transition. `board()` exposes the inner
-[`WhiteboardView`](#whiteboardview) (e.g. to `set_scene` on refresh).
+[`WhiteboardView`](#whiteboardview) (e.g. to read its `scene()`).
 
 ---
 
@@ -693,8 +766,8 @@ pub enum Tool {
 
 The active tool. UI state — not part of the persisted scene. `Pan` is the
 default (navigation before drawing). The view renders its own toolbar for
-these and handles their single-key shortcuts (`H V P R O D G U S X L A T N I`;
-`Embed` has no key) — use
+these and handles their single-key shortcuts (`H V P R O D G U S X L A K T N M F I`;
+`Embed` and the three curved tools have no key) — use
 [`set_tool`](#whiteboardviewset_tool)/[`tool`](#whiteboardviewtool) only to
 drive tools from your own chrome.
 
@@ -1028,7 +1101,7 @@ Which face the Font flyout offers — handed to the host's
 | Variant | Meaning |
 | --- | --- |
 | `Upload` | Pick a `.ttf` / `.otf` from disk (the host shows the file dialog). |
-| `Default` | Revert to the bundled default face (JetBrains Mono). |
+| `Default` | Revert to [`Font::default()`](#font). |
 
 ---
 
@@ -1110,6 +1183,34 @@ pub fn new(scene: Scene, style: WhiteboardStyleFn, cx: &mut Context<Self>) -> Se
 
 Build a view over `scene`. Call inside `cx.new(|cx| WhiteboardView::new(..))`.
 
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `scene` | `Scene` | The board to edit — `Scene::default()` or [`Scene::from_json`](#scenefrom_json) of a stored board. Taken by value; the view owns it. |
+| `style` | `WhiteboardStyleFn` | Theme closure, read each paint. |
+| `cx` | `&mut Context<Self>` | Entity context (used to create the focus handle). |
+
+**Returns** — the view. Infallible.
+
+**Guarantees & edge cases**
+
+- The internal id counter seeds from `max(element ids) + 1` (0 for an empty
+  board), so new elements never collide with loaded ones.
+- Initial state: tool `Pan`, nothing selected, no hooks installed, empty
+  saved-colors and templates, default toolbar layout (top-center, horizontal),
+  `Font::default()`, empty undo history.
+
+**Example**
+
+```rust
+let board = cx.new(|cx| {
+    let mut v = WhiteboardView::new(Scene::from_json(&stored), style_fn.clone(), cx);
+    v.set_on_change(Rc::new(|json, _w, _cx| store(json)));
+    v
+});
+```
+
 ### Read-only mode
 
 ```rust
@@ -1139,34 +1240,6 @@ the given world point / the current viewport center. Both are also on the
 toolbar's shapes flyout; one undo step each. Mind-map trees keep their layout
 and connectors in sync as nodes are added (the selection's "+" buttons),
 moved, or deleted; a selected root offers Direction and Connector pickers.
-
-**Parameters**
-
-| Name | Type | Description |
-| --- | --- | --- |
-| `scene` | `Scene` | The board to edit — `Scene::default()` or [`Scene::from_json`](#scenefrom_json) of a stored board. Taken by value; the view owns it. |
-| `style` | `WhiteboardStyleFn` | Theme closure, read each paint. |
-| `cx` | `&mut Context<Self>` | Entity context (used to create the focus handle). |
-
-**Returns** — the view. Infallible.
-
-**Guarantees & edge cases**
-
-- The internal id counter seeds from `max(element ids) + 1` (0 for an empty
-  board), so new elements never collide with loaded ones.
-- Initial state: tool `Pan`, nothing selected, no hooks installed, empty
-  saved-colors and templates, default toolbar layout (top-center, horizontal),
-  bundled font, empty undo history.
-
-**Example**
-
-```rust
-let board = cx.new(|cx| {
-    let mut v = WhiteboardView::new(Scene::from_json(&stored), style_fn.clone(), cx);
-    v.set_on_change(Rc::new(|json, _w, _cx| store(json)));
-    v
-});
-```
 
 ### Hook installers
 
@@ -1556,7 +1629,7 @@ elbow connectors), and text as glyph outlines in `font`. Text decorations
 ```rust
 pub struct Font { /* Arc<Vec<u8>> + face index */ }
 
-impl Default for Font { /* the bundled JetBrains Mono Regular (OFL) */ }
+impl Default for Font { /* a system Unicode/CJK face, else the bundled JetBrains Mono Regular (OFL) */ }
 ```
 
 A font backing whiteboard text. Board text is rendered as **vector outlines**
@@ -1565,14 +1638,39 @@ camera; a `Font` is just the raw face bytes, parsed on demand. `Clone` is an
 `Arc` bump — cheap. Unlike everything else in this crate, `Font` holds no
 `Rc`/gpui state and its methods are pure — safe to use from any thread.
 
+`Font::default()` uses the first broad Unicode/CJK system face it finds (Arial
+Unicode, PingFang, Hiragino Sans GB, STHeiti, Microsoft YaHei, SimHei, SimSun,
+Noto Sans CJK), read once per process, and falls back to the bundled JetBrains
+Mono when none is installed.
+
+**Shaping, direction, fallback** — every method below lays text out the same
+way, so glyphs, carets, hit-tests and selections always agree:
+
+- *Per-character fallback.* Each character comes from the first face that has
+  it: the font itself, then a fixed list of system faces (Segoe UI, Malgun
+  Gothic, Yu Gothic, SF Arabic / SF Hebrew, Apple SD Gothic Neo, DejaVu Sans,
+  Noto Sans Arabic / Hebrew / CJK, …; paths that don't exist are skipped), then
+  on Linux (and other non-macOS Unix) the face `fc-list` reports for that character. Arabic is only taken
+  from a face whose OpenType substitutions cover Arabic, so letters join.
+  Fallback faces are read on first use and kept. Line metrics stay the font's
+  own; a character no face has draws as the font's `.notdef`.
+- *Shaping.* Runs that need it (Arabic, Hebrew points, Indic, Thai, combining
+  marks) are shaped with `rustybuzz`; Latin, Greek, Cyrillic and CJK use plain
+  glyph lookup (so no code ligatures).
+- *Bidi.* Each hard line is one Unicode bidi paragraph (`unicode-bidi`), its
+  direction set by its first strong character. Lines wrap in logical order,
+  then each visual line is reordered for display. Lines of a right-to-left
+  paragraph align to the block's right edge.
+
 All coordinates and sizes in the methods below are **unit-agnostic** (the
 whiteboard passes world units): text-local space with the origin at the
 block's top-left, x right, y **down**. `content` newlines break lines; byte
 offsets are UTF-8 offsets into `content`.
 
 **Cost** — every method re-parses the face from bytes
-(`ttf_parser::Face::parse`) per call. That's a header parse, not a decode —
-fine at UI frequency, but don't call in a tight per-glyph loop.
+(`ttf_parser::Face::parse`) and re-runs the layout per call. That's a header
+parse plus a line layout, not a decode — fine at UI frequency, but don't call
+in a tight per-glyph loop.
 
 ### `Font::from_bytes`
 
@@ -1643,16 +1741,54 @@ Text-local top-left of the caret at content byte offset `at` (the `_wrapped`
 variant honors a wrap width — label editing). Out-of-range or non-boundary
 offsets clamp to the end of the text. Caret stops come from the same layout
 pass as the glyphs, so the caret always lands exactly between rendered
-characters.
+characters. At a soft wrap, the shared boundary offset is drawn at the start
+of the next line.
 
-### `Font::index_at_wrapped`
+### `Font::caret_step_wrapped`
 
 ```rust
+pub fn caret_step_wrapped(
+    &self,
+    content: &str,
+    font_size: f32,
+    max_width: Option<f32>,
+    at: usize,
+    dir: i32,
+) -> Option<usize>
+```
+
+The caret stop one step left or right of offset `at` **on screen** — how the
+Left / Right arrow keys move through mixed-direction text, where the logical
+neighbor may be on the other side of the caret.
+
+**Parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `content` | `&str` | The text. |
+| `font_size` | `f32` | Font size (world units in board use). |
+| `max_width` | `Option<f32>` | Wrap width, or `None` for no wrapping. |
+| `at` | `usize` | The caret's current byte offset. |
+| `dir` | `i32` | Negative = step left, positive = step right. |
+
+**Returns** — the byte offset of the nearest caret stop strictly that way on
+`at`'s visual line (ties go to the logically nearest). At the edge of a
+soft-wrapped line it continues onto the paragraph's previous or next visual
+line, entering from the side the caret is moving away from. `None` when `at`
+isn't a caret stop, or at a line edge with no soft-wrapped line to continue
+onto (a hard `'\n'`, or the text's first / last line); the caller then steps
+logically.
+
+### `Font::index_at` / `Font::index_at_wrapped`
+
+```rust
+pub fn index_at(&self, content: &str, font_size: f32, p: [f32; 2]) -> usize
 pub fn index_at_wrapped(&self, content: &str, font_size: f32, max_width: Option<f32>, p: [f32; 2]) -> usize
 ```
 
 The content byte offset whose caret sits nearest the text-local point `p` —
-how a click lands the caret between letters. Picks the line by `p[1]`
+how a click lands the caret between letters (`index_at` is
+`index_at_wrapped(…, None, p)`). Picks the line by `p[1]`
 (clamped to the first/last line), then the closest caret stop by `p[0]`.
 Returns 0 for empty layouts. Always a valid char boundary of `content`.
 
@@ -1664,24 +1800,28 @@ pub fn selection_rects_wrapped(&self, content: &str, font_size: f32, max_width: 
 ```
 
 Text-local highlight rectangles `[x, y, w, h]` for the selection
-`[start, end)` (byte offsets) — one rect per line the selection touches.
-`start >= end` returns an empty vec. A line whose trailing newline is inside
-the selection gets a small stub (0.3 × font size) so selected newlines and
-empty lines still read.
+`[start, end)` (byte offsets) — at least one rect per line the selection
+touches, more where a logical range splits across a direction change.
+`start >= end` returns an empty vec. A line with no selected glyphs whose
+newline is selected (an empty line, or a selection starting at a line's end)
+gets a small stub (0.3 × font size) on its trailing side so it still reads.
 
-### `Font::layout_wrapped` / `Font::layout_styled` (crate-internal)
+### `Font::layout` / `Font::layout_wrapped` / `Font::layout_styled`
 
 ```rust
+pub fn layout(&self, content: &str, font_size: f32) -> TextLayout
 pub fn layout_wrapped(&self, content: &str, font_size: f32, max_width: Option<f32>) -> TextLayout
 pub fn layout_styled(&self, content: &str, font_size: f32, max_width: Option<f32>,
                      style_at: impl Fn(usize) -> GlyphStyle) -> StyledLayout
 ```
 
 The outline-producing layout passes the whiteboard's renderer feeds to gpui's
-`PathBuilder`. They are `pub`, **but their types (`TextLayout`,
-`StyledLayout`, `GlyphStyle`, `Seg`, `Decoration`, `DecoKind`) live in the
-crate's private `font` module and are not re-exported** — so outside the crate
-`layout_wrapped`'s result can't be named (usable only via inference), and
+`PathBuilder` (`layout` is `layout_wrapped(…, None)`). They are `pub`, **but
+their types (`TextLayout`, `StyledLayout`, `GlyphStyle`, `Decoration`,
+`DecoKind`) live in the crate's private `font` module and are not
+re-exported** (only [`Seg`](#export) is) — so outside the crate the result of
+`layout` / `layout_wrapped` can't be named (usable only via inference: its
+`segs`, `width`, `height`, `line_height` and `caret` fields are public), and
 `layout_styled` can't be called at all (you can't produce a `GlyphStyle`).
 Treat both as internal; the supported external surface is the
 measure/caret/selection methods above. `layout_styled` bakes synthetic italic
