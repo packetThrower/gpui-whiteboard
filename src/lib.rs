@@ -6032,14 +6032,27 @@ fn shape_label_block(
     };
     let wrap = (bw * wf - 2.0 * LABEL_PAD).max(1.0);
     let ih = (bh * hf - 2.0 * LABEL_PAD).max(1.0);
-    // A sticky note writes from the top-left like a pad, clear of its fold.
+    // A sticky note writes from the top-left like a pad, clear of its fold —
+    // top-right when its text starts right to left.
     if matches!(kind, ElementKind::Sticky(_)) {
         let pad = LABEL_PAD.max(bw.min(bh) * 0.08);
         let wrap = (bw - 2.0 * pad).max(1.0);
         let ih = (bh - 2.0 * pad - bw.min(bh) * 0.08).max(1.0);
         let size = font.fit_size(label, wrap, ih, TEXT_SIZE);
+        // ponytail: anchors the whole block by the first line's direction; a
+        // mixed sticky's opposite-direction lines align within the block, not
+        // the pad. Per-line alignment to `wrap` if that ever matters.
+        let first = label.split('\n').next().unwrap_or("");
+        let rtl = unicode_bidi::ParagraphBidiInfo::new(first, None)
+            .paragraph_level
+            .is_rtl();
+        let x = if rtl {
+            bx + bw - pad - font.measure_wrapped(label, size, Some(wrap)).0
+        } else {
+            bx + pad
+        };
         return LabelBlock {
-            x: bx + pad,
+            x,
             y: by + pad,
             size,
             wrap,
@@ -8486,6 +8499,29 @@ mod tests {
             "Enter starts a new line"
         );
         assert_eq!(label_text(Some(" ab \n"), false), "ab");
+    }
+
+    /// A sticky's right-to-left text hugs the pad's right edge; Latin stays left.
+    #[test]
+    fn sticky_rtl_label_starts_at_the_right() {
+        let font = Font::default();
+        let st = ElementKind::Sticky(BoxGeom {
+            x: 0.0,
+            y: 0.0,
+            w: 200.0,
+            h: 200.0,
+            width: 0.0,
+            rotation: 0.0,
+        });
+        let ltr = shape_label_block(&font, &st, 0.0, 0.0, 200.0, 200.0, "hi");
+        let rtl = shape_label_block(&font, &st, 0.0, 0.0, 200.0, 200.0, "שלום");
+        let w = font.measure_wrapped("שלום", rtl.size, Some(rtl.wrap)).0;
+        assert!(
+            (rtl.x + w - (200.0 - ltr.x)).abs() < 0.01,
+            "{} + {w}",
+            rtl.x
+        );
+        assert!(rtl.x > ltr.x);
     }
 
     #[test]
