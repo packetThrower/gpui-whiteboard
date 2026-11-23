@@ -833,6 +833,31 @@ impl Font {
             .unwrap_or([0.0, 0.0])
     }
 
+    /// The caret stop one step left (`dir < 0`) or right of offset `at` on its
+    /// visual line: the nearest stop strictly that way on screen (ties go to the
+    /// logically nearest). `None` at the line's edge. Walking stops by x, not
+    /// logical neighbors, keeps arrows moving through mixed-direction text.
+    pub fn caret_step_wrapped(
+        &self,
+        content: &str,
+        font_size: f32,
+        max_width: Option<f32>,
+        at: usize,
+        dir: i32,
+    ) -> Option<usize> {
+        let (lines, _) = self.line_stops(content, font_size, max_width);
+        let line = lines.iter().find(|l| l.stops.iter().any(|s| s.0 == at))?;
+        let x = line.stops.iter().find(|s| s.0 == at)?.1;
+        line.stops
+            .iter()
+            .filter(|s| (s.1 - x) * dir as f32 > 0.01)
+            .min_by(|a, b| {
+                let key = |s: &(usize, f32)| ((s.1 - x).abs(), s.0.abs_diff(at));
+                key(a).partial_cmp(&key(b)).unwrap()
+            })
+            .map(|s| s.0)
+    }
+
     /// The content byte offset whose caret sits nearest the local point `p`
     /// (text-local space). Picks the line by y, then the closest caret stop by x —
     /// so a click lands the caret between letters like a real text field.
@@ -1268,6 +1293,24 @@ mod tests {
             f.caret_pos(two, 20.0, 9)[0] < 0.01,
             "the Latin line stays left"
         );
+    }
+
+    /// Stepping left from the visual right edge of mixed RTL + Latin text
+    /// reaches the left edge (no ping-pong inside the Latin run).
+    #[test]
+    fn caret_steps_cross_mixed_direction_text() {
+        let f = Font::from_bytes(DEFAULT_FONT.to_vec(), 0).unwrap();
+        let s = "שלום 25 dollars טוב";
+        let x = |b| f.caret_pos(s, 20.0, b)[0];
+        let mut at = 0; // logical start = visual right edge
+        let mut n = 0;
+        while let Some(next) = f.caret_step_wrapped(s, 20.0, None, at, -1) {
+            assert!(x(next) < x(at), "{at} -> {next}");
+            at = next;
+            n += 1;
+            assert!(n <= s.len(), "stuck");
+        }
+        assert!(x(at) < 0.01, "ended at {at}, x {}", x(at));
     }
 
     #[test]
