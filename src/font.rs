@@ -815,9 +815,10 @@ impl Font {
         at: usize,
     ) -> [f32; 2] {
         let (lines, _) = self.line_stops(content, font_size, max_width);
-        for line in &lines {
-            // A boundary byte belongs to exactly one line (the '\n' separates
-            // line i's end from line i+1's start), so the first match is correct.
+        // A soft wrap's boundary byte ends one line and starts the next; the
+        // caret draws it at the next line's start (a '\n' boundary is on one
+        // line only).
+        for line in lines.iter().rev() {
             for &(b, x) in &line.stops {
                 if b == at {
                     return [x, line.top];
@@ -848,12 +849,16 @@ impl Font {
         let (lines, _) = self.line_stops(content, font_size, max_width);
         let i = lines
             .iter()
-            .position(|l| l.stops.iter().any(|s| s.0 == at))?;
+            .rposition(|l| l.stops.iter().any(|s| s.0 == at))?;
         let line = &lines[i];
         let x = line.stops.iter().find(|s| s.0 == at)?.1;
         // A soft wrap's boundary offset sits on both lines but the caret draws
-        // it on the first; only stops a line owns are places to land there.
-        let owns = |j: usize, b: usize| j == 0 || !lines[j - 1].stops.iter().any(|s| s.0 == b);
+        // it on the second; only stops a line owns are places to land there.
+        let owns = |j: usize, b: usize| {
+            lines
+                .get(j + 1)
+                .is_none_or(|l| !l.stops.iter().any(|s| s.0 == b))
+        };
         let step = line
             .stops
             .iter()
@@ -1032,8 +1037,10 @@ fn visual_line(
 ) -> LineStops {
     let mut glyphs = Vec::new();
     let mut pen = 0.0_f32;
+    let mut line_levels = Vec::new();
     if !seg.is_empty() {
         let (levels, vruns) = bidi.visual_runs(seg.clone());
+        line_levels = levels.clone();
         for vr in vruns {
             let rtl = levels[vr.start].is_rtl();
             let abs = base + vr.start..base + vr.end;
@@ -1070,20 +1077,35 @@ fn visual_line(
         }
     }
     clusters.sort_by_key(|c| c.0);
+    let level = |b: usize| line_levels.get(b - base).map_or(0, |l| l.number());
     let end = base + seg.end;
     let mut stops = Vec::with_capacity(seg.len() + 1);
     let mut trailing = 0.0;
+    let mut prev_level = None;
     for (k, &(b, x0, x1, rtl)) in clusters.iter().enumerate() {
         let (lead, trail) = if rtl { (x1, x0) } else { (x0, x1) };
         let next = clusters.get(k + 1).map_or(end, |c| c.0);
+        // Where an embedded run (higher bidi level) ends, the boundary draws
+        // at that run's trailing edge, not at the next cluster's leading edge
+        // (which the run's start already has): every edge gets a stop.
+        let first = match prev_level {
+            Some(p) if p > level(b) => trailing,
+            _ => lead,
+        };
         // Boundaries inside a multi-char cluster (a ligature, a base + marks)
         // split it evenly.
         let chars = content[b..next].char_indices().map(|(i, _)| b + i);
         let n = content[b..next].chars().count() as f32;
         for (j, at) in chars.enumerate() {
-            stops.push((at, lead + (trail - lead) * j as f32 / n));
+            let x = if j == 0 {
+                first
+            } else {
+                lead + (trail - lead) * j as f32 / n
+            };
+            stops.push((at, x));
         }
         trailing = trail;
+        prev_level = Some(level(b));
     }
     stops.push((end, trailing));
     LineStops {
@@ -1357,12 +1379,19 @@ mod tests {
 
     fn wrap_walk(f: &Font, s: &str, rtl: bool) {
         let w = Some(f.measure(s, 20.0).0 * 0.55);
+        // Every offset is one caret stop: a full walk visits each exactly once.
         let walk = |from: usize, dir: i32| {
-            let mut at = from;
+            let mut seen = vec![from];
             for _ in 0..2 * s.len() {
-                match f.caret_step_wrapped(s, 20.0, w, at, dir) {
-                    Some(n) => at = n,
-                    None => return at,
+                match f.caret_step_wrapped(s, 20.0, w, *seen.last().unwrap(), dir) {
+                    Some(n) => seen.push(n),
+                    None => {
+                        let mut all = seen.clone();
+                        all.sort();
+                        all.dedup();
+                        assert_eq!(all.len(), s.chars().count() + 1, "{s}: {seen:?}");
+                        return *seen.last().unwrap();
+                    }
                 }
             }
             panic!("stuck walking {dir} from {from}");
